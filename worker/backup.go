@@ -32,7 +32,7 @@ func backup(gid uint32, bpath string) error {
 	it := pstore.NewIterator()
 	defer it.Close()
 	var wg sync.WaitGroup
-	var lastPred string
+	// var lastPred string
 
 	wg.Add(numBackupRoutines)
 	for i := 0; i < numBackupRoutines; i++ {
@@ -45,34 +45,41 @@ func backup(gid uint32, bpath string) error {
 	}
 	go writeToFile(strconv.Itoa(int(gid)), bpath, ch, errChan)
 
-	it.SeekToFirst()
-	for it.Valid() {
-		if bytes.ContainsRune(it.Key().Data(), ':') {
-			// Seek to the end of index keys.
-			pre := bytes.Split(it.Key().Data(), []byte("|"))[0]
-			pre = append(pre, '~')
-			it.Seek(pre)
-			continue
-		}
-		if bytes.HasPrefix(it.Key().Data(), []byte("_uid_")) {
+	uidPrefix := []byte("_uid_")
+	count := 0
+	for it.SeekToFirst(); it.Valid(); {
+		key := it.Key().Data()
+		// cidx := bytes.IndexRune(key, ':')
+		// if cidx > -1 {
+		// 	// Seek to the end of index keys.
+		// 	// NOTE: We can't directly assign pre to key, because key is pointing to unsafe C array.
+		// 	pre := make([]byte, cidx+2)
+		// 	copy(pre[0:cidx+1], key)
+		// 	pre[cidx+1] = '~'
+		// 	it.Seek(pre)
+		// 	continue
+		// }
+		if bytes.HasPrefix(key, uidPrefix) {
 			// Skip the UID mappings.
 			it.Seek([]byte("_uid_~"))
 			continue
 		}
-		pred, uid := posting.SplitKey(it.Key().Data())
-		if pred != lastPred && BelongsTo(pred) != gid {
-			it.Seek([]byte(fmt.Sprintf("%s~", pred)))
-			continue
-		}
+		pred, uid := posting.SplitKey(key)
+		// if pred != lastPred && BelongsTo(pred) != gid {
+		// 	it.Seek([]byte(fmt.Sprintf("%s~", pred)))
+		// 	continue
+		// }
 
-		k := []byte(fmt.Sprintf("<_uid_:%x> <%s> ", uid, pred))
+		k := []byte(fmt.Sprintf("<_uid_:%#x> <%s> ", uid, pred))
 		v := make([]byte, len(it.Value().Data()))
+		count++
+		fmt.Println(count)
 		copy(v, it.Value().Data())
 		chkv <- kv{
 			key:   k,
 			value: v,
 		}
-		lastPred = pred
+		// lastPred = pred
 		it.Next()
 	}
 
