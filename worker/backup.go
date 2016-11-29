@@ -122,9 +122,8 @@ func toRDF(item kv, ch chan []byte) {
 		}
 		// Uid list
 		destUID := p.Uid()
-		strUID := strconv.FormatUint(destUID, 16)
 
-		_, err := buf.WriteString(fmt.Sprintf("<_uid_:%s> .\n", strUID))
+		_, err := buf.WriteString(fmt.Sprintf("<_uid_:%#x> .\n", destUID))
 		x.Check(err)
 		if buf.Len() >= 50000 {
 			ch <- buf.Bytes()
