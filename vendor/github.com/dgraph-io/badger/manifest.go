@@ -27,12 +27,12 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/dgraph-io/badger/protos"
+	"github.com/dgraph-io/badger/pb"
 	"github.com/dgraph-io/badger/y"
 	"github.com/pkg/errors"
 )
 
-// Manifest represnts the contents of the MANIFEST file in a Badger store.
+// Manifest represents the contents of the MANIFEST file in a Badger store.
 //
 // The MANIFEST file describes the startup state of the db -- all LSM files and what level they're
 // at.
@@ -42,7 +42,7 @@ import (
 // reconstruct the manifest at startup.
 type Manifest struct {
 	Levels []levelManifest
-	Tables map[uint64]tableManifest
+	Tables map[uint64]TableManifest
 
 	// Contains total number of creation and deletion changes in the manifest -- used to compute
 	// whether it'd be useful to rewrite the manifest.
@@ -54,7 +54,7 @@ func createManifest() Manifest {
 	levels := make([]levelManifest, 0)
 	return Manifest{
 		Levels: levels,
-		Tables: make(map[uint64]tableManifest),
+		Tables: make(map[uint64]TableManifest),
 	}
 }
 
@@ -64,10 +64,11 @@ type levelManifest struct {
 	Tables map[uint64]struct{} // Set of table id's
 }
 
-// tableManifest contains information about a specific level
+// TableManifest contains information about a specific level
 // in the LSM tree.
-type tableManifest struct {
-	Level uint8
+type TableManifest struct {
+	Level    uint8
+	Checksum []byte
 }
 
 // manifestFile holds the file pointer (and other info) about the manifest file, which is a log
@@ -95,16 +96,16 @@ const (
 
 // asChanges returns a sequence of changes that could be used to recreate the Manifest in its
 // present state.
-func (m *Manifest) asChanges() []*protos.ManifestChange {
-	changes := make([]*protos.ManifestChange, 0, len(m.Tables))
+func (m *Manifest) asChanges() []*pb.ManifestChange {
+	changes := make([]*pb.ManifestChange, 0, len(m.Tables))
 	for id, tm := range m.Tables {
-		changes = append(changes, makeTableCreateChange(id, int(tm.Level)))
+		changes = append(changes, newCreateChange(id, int(tm.Level), tm.Checksum))
 	}
 	return changes
 }
 
 func (m *Manifest) clone() Manifest {
-	changeSet := protos.ManifestChangeSet{Changes: m.asChanges()}
+	changeSet := pb.ManifestChangeSet{Changes: m.asChanges()}
 	ret := createManifest()
 	y.Check(applyChangeSet(&ret, &changeSet))
 	return ret
@@ -112,16 +113,23 @@ func (m *Manifest) clone() Manifest {
 
 // openOrCreateManifestFile opens a Badger manifest file if it exists, or creates on if
 // one doesn’t.
-func openOrCreateManifestFile(dir string) (ret *manifestFile, result Manifest, err error) {
-	return helpOpenOrCreateManifestFile(dir, manifestDeletionsRewriteThreshold)
+func openOrCreateManifestFile(dir string, readOnly bool) (ret *manifestFile, result Manifest, err error) {
+	return helpOpenOrCreateManifestFile(dir, readOnly, manifestDeletionsRewriteThreshold)
 }
 
-func helpOpenOrCreateManifestFile(dir string, deletionsThreshold int) (ret *manifestFile, result Manifest, err error) {
+func helpOpenOrCreateManifestFile(dir string, readOnly bool, deletionsThreshold int) (ret *manifestFile, result Manifest, err error) {
 	path := filepath.Join(dir, ManifestFilename)
-	fp, err := y.OpenExistingSyncedFile(path, false) // We explicitly sync in addChanges, outside the lock.
+	var flags uint32
+	if readOnly {
+		flags |= y.ReadOnly
+	}
+	fp, err := y.OpenExistingFile(path, flags) // We explicitly sync in addChanges, outside the lock.
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, Manifest{}, err
+		}
+		if readOnly {
+			return nil, Manifest{}, fmt.Errorf("no manifest found, required for read-only db")
 		}
 		m := createManifest()
 		fp, netCreations, err := helpRewrite(dir, &m)
@@ -144,12 +152,13 @@ func helpOpenOrCreateManifestFile(dir string, deletionsThreshold int) (ret *mani
 		return nil, Manifest{}, err
 	}
 
-	// Truncate file so we don't have a half-written entry at the end.
-	if err := fp.Truncate(truncOffset); err != nil {
-		_ = fp.Close()
-		return nil, Manifest{}, err
+	if !readOnly {
+		// Truncate file so we don't have a half-written entry at the end.
+		if err := fp.Truncate(truncOffset); err != nil {
+			_ = fp.Close()
+			return nil, Manifest{}, err
+		}
 	}
-
 	if _, err = fp.Seek(0, io.SeekEnd); err != nil {
 		_ = fp.Close()
 		return nil, Manifest{}, err
@@ -172,8 +181,8 @@ func (mf *manifestFile) close() error {
 // we replay the MANIFEST file, we'll either replay all the changes or none of them.  (The truth of
 // this depends on the filesystem -- some might append garbage data if a system crash happens at
 // the wrong time.)
-func (mf *manifestFile) addChanges(changesParam []*protos.ManifestChange) error {
-	changes := protos.ManifestChangeSet{Changes: changesParam}
+func (mf *manifestFile) addChanges(changesParam []*pb.ManifestChange) error {
+	changes := pb.ManifestChangeSet{Changes: changesParam}
 	buf, err := changes.Marshal()
 	if err != nil {
 		return err
@@ -227,7 +236,7 @@ func helpRewrite(dir string, m *Manifest) (*os.File, int, error) {
 
 	netCreations := len(m.Tables)
 	changes := m.asChanges()
-	set := protos.ManifestChangeSet{Changes: changes}
+	set := pb.ManifestChangeSet{Changes: changes}
 
 	changeBuf, err := set.Marshal()
 	if err != nil {
@@ -256,7 +265,7 @@ func helpRewrite(dir string, m *Manifest) (*os.File, int, error) {
 	if err := os.Rename(rewritePath, manifestPath); err != nil {
 		return nil, 0, err
 	}
-	fp, err = y.OpenExistingSyncedFile(manifestPath, false)
+	fp, err = y.OpenExistingFile(manifestPath, 0)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -357,7 +366,7 @@ func ReplayManifestFile(fp *os.File) (ret Manifest, truncOffset int64, err error
 			break
 		}
 
-		var changeSet protos.ManifestChangeSet
+		var changeSet pb.ManifestChangeSet
 		if err := changeSet.Unmarshal(buf); err != nil {
 			return Manifest{}, 0, err
 		}
@@ -370,21 +379,22 @@ func ReplayManifestFile(fp *os.File) (ret Manifest, truncOffset int64, err error
 	return build, offset, err
 }
 
-func applyManifestChange(build *Manifest, tc *protos.ManifestChange) error {
+func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 	switch tc.Op {
-	case protos.ManifestChange_CREATE:
+	case pb.ManifestChange_CREATE:
 		if _, ok := build.Tables[tc.Id]; ok {
 			return fmt.Errorf("MANIFEST invalid, table %d exists", tc.Id)
 		}
-		build.Tables[tc.Id] = tableManifest{
-			Level: uint8(tc.Level),
+		build.Tables[tc.Id] = TableManifest{
+			Level:    uint8(tc.Level),
+			Checksum: append([]byte{}, tc.Checksum...),
 		}
 		for len(build.Levels) <= int(tc.Level) {
 			build.Levels = append(build.Levels, levelManifest{make(map[uint64]struct{})})
 		}
 		build.Levels[tc.Level].Tables[tc.Id] = struct{}{}
 		build.Creations++
-	case protos.ManifestChange_DELETE:
+	case pb.ManifestChange_DELETE:
 		tm, ok := build.Tables[tc.Id]
 		if !ok {
 			return fmt.Errorf("MANIFEST removes non-existing table %d", tc.Id)
@@ -400,7 +410,7 @@ func applyManifestChange(build *Manifest, tc *protos.ManifestChange) error {
 
 // This is not a "recoverable" error -- opening the KV store fails because the MANIFEST file is
 // just plain broken.
-func applyChangeSet(build *Manifest, changeSet *protos.ManifestChangeSet) error {
+func applyChangeSet(build *Manifest, changeSet *pb.ManifestChangeSet) error {
 	for _, change := range changeSet.Changes {
 		if err := applyManifestChange(build, change); err != nil {
 			return err
@@ -409,17 +419,18 @@ func applyChangeSet(build *Manifest, changeSet *protos.ManifestChangeSet) error 
 	return nil
 }
 
-func makeTableCreateChange(id uint64, level int) *protos.ManifestChange {
-	return &protos.ManifestChange{
-		Id:    id,
-		Op:    protos.ManifestChange_CREATE,
-		Level: uint32(level),
+func newCreateChange(id uint64, level int, checksum []byte) *pb.ManifestChange {
+	return &pb.ManifestChange{
+		Id:       id,
+		Op:       pb.ManifestChange_CREATE,
+		Level:    uint32(level),
+		Checksum: checksum,
 	}
 }
 
-func makeTableDeleteChange(id uint64) *protos.ManifestChange {
-	return &protos.ManifestChange{
+func newDeleteChange(id uint64) *pb.ManifestChange {
+	return &pb.ManifestChange{
 		Id: id,
-		Op: protos.ManifestChange_DELETE,
+		Op: pb.ManifestChange_DELETE,
 	}
 }

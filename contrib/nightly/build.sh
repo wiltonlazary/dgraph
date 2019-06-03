@@ -58,21 +58,23 @@ cp dgraph $tmp_dir
 
 popd
 
-pushd $ratel
-echo -e "\033[1;33mBuilding ratel binary for $platform\033[0m"
-go build -ldflags \
-  "-X $ratel_release=$release_version" -o dgraph-ratel
-strip -x dgraph-ratel
-checksum=$($digest_cmd dgraph-ratel | awk '{print $1}')
-echo "$checksum /usr/local/bin/dgraph-ratel" >> $checksum_file
-cp dgraph-ratel $tmp_dir
+
+if [ -d "$ratel" ]; then
+  pushd $ratel
+  echo -e "\033[1;33mBuilding ratel binary for $platform\033[0m"
+  go build -ldflags \
+    "-X $ratel_release=$release_version" -o dgraph-ratel
+  strip -x dgraph-ratel
+  checksum=$($digest_cmd dgraph-ratel | awk '{print $1}')
+  echo "$checksum /usr/local/bin/dgraph-ratel" >> $checksum_file
+  cp dgraph-ratel $tmp_dir
+  popd
+fi
 
 echo -e "\n\033[1;34mSize of files after  strip: $(du -sh $tmp_dir)\033[0m"
 
 echo -e "\n\033[1;33mCreating tar file\033[0m"
 tar_file=dgraph-"$platform"-amd64
-#popd &> /dev/null
-popd
 
 # Create a tar file with the contents of the dgraph folder (i.e the binaries)
 tar -zvcf $tar_file.tar.gz -C $tmp_dir .;
@@ -80,8 +82,8 @@ echo -e "\n\033[1;34mSize of tar file: $(du -sh $tar_file.tar.gz)\033[0m"
 
 mv $tmp_dir ./
 
-# Only run this locally.
-if [[ $TRAVIS != true ]]; then
+# Only run this locally, if DOCKER environment variable is set to true.
+if [[ $DOCKER == true ]]; then
   docker build -t dgraph/dgraph:master -f $GOPATH/src/github.com/dgraph-io/dgraph/contrib/nightly/Dockerfile .
 fi
 

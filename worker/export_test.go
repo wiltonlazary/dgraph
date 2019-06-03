@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
@@ -20,8 +19,10 @@ package worker
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"io/ioutil"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,13 +31,16 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/dgraph-io/dgo/protos/api"
+
 	"github.com/dgraph-io/dgraph/gql"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/posting"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/types/facets"
+	"github.com/dgraph-io/dgraph/z"
 
-	"github.com/dgraph-io/dgraph/rdf"
+	"github.com/dgraph-io/dgraph/chunker/rdf"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/x"
 )
@@ -48,11 +52,12 @@ func populateGraphExport(t *testing.T) {
 		`<3> <friend> <5> .`,
 		`<4> <friend> <5> <author0> (since=2005-05-02T15:04:05,close=true,` +
 			`age=33,game="football",poem="roses are red\nviolets are blue") .`,
-		`<1> <name> "pho\ton" <author0> .`,
+		`<1> <name> "pho\ton\u0000" <author0> .`,
 		`<2> <name> "pho\ton"@en <author0> .`,
 		`<3> <name> "First Line\nSecondLine" .`,
 		"<1> <friend_not_served> <5> <author0> .",
 		`<5> <name> "" .`,
+		`<6> <name> "Ding!\u0007Ding!\u0007Ding!\u0007" .`,
 	}
 	idMap := map[string]uint64{
 		"1": 1,
@@ -60,12 +65,13 @@ func populateGraphExport(t *testing.T) {
 		"3": 3,
 		"4": 4,
 		"5": 5,
+		"6": 6,
 	}
 
 	for _, edge := range rdfEdges {
 		nq, err := rdf.Parse(edge)
 		require.NoError(t, err)
-		rnq := gql.NQuad{&nq}
+		rnq := gql.NQuad{NQuad: &nq}
 		err = facets.SortAndValidate(rnq.Facets)
 		require.NoError(t, err)
 		e, err := rnq.ToEdgeUsing(idMap)
@@ -77,7 +83,7 @@ func populateGraphExport(t *testing.T) {
 func initTestExport(t *testing.T, schemaStr string) {
 	schema.ParseBytes([]byte(schemaStr), 1)
 
-	val, err := (&intern.SchemaUpdate{ValueType: intern.Posting_UID}).Marshal()
+	val, err := (&pb.SchemaUpdate{ValueType: pb.Posting_UID}).Marshal()
 	require.NoError(t, err)
 
 	txn := pstore.NewTransactionAt(math.MaxUint64, true)
@@ -87,7 +93,7 @@ func initTestExport(t *testing.T, schemaStr string) {
 	txn.Discard()
 
 	require.NoError(t, err)
-	val, err = (&intern.SchemaUpdate{ValueType: intern.Posting_UID}).Marshal()
+	val, err = (&pb.SchemaUpdate{ValueType: pb.Posting_UID}).Marshal()
 	require.NoError(t, err)
 
 	txn = pstore.NewTransactionAt(math.MaxUint64, true)
@@ -99,7 +105,58 @@ func initTestExport(t *testing.T, schemaStr string) {
 	populateGraphExport(t)
 }
 
-func TestExport(t *testing.T) {
+func getExportFileList(t *testing.T, bdir string) (dataFiles, schemaFiles []string) {
+	searchDir := bdir
+	err := filepath.Walk(searchDir, func(path string, f os.FileInfo, err error) error {
+		if f.IsDir() {
+			return nil
+		}
+		if path != bdir {
+			if strings.Contains(path, "schema") {
+				schemaFiles = append(schemaFiles, path)
+			} else {
+				dataFiles = append(dataFiles, path)
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(dataFiles), "filelist=%v", dataFiles)
+
+	return
+}
+
+func checkExportSchema(t *testing.T, schemaFileList []string) {
+	require.Equal(t, 1, len(schemaFileList))
+	file := schemaFileList[0]
+	f, err := os.Open(file)
+	require.NoError(t, err)
+
+	r, err := gzip.NewReader(f)
+	require.NoError(t, err)
+
+	scanner := bufio.NewScanner(r)
+	count := 0
+	for scanner.Scan() {
+		result, err := schema.Parse(scanner.Text())
+		require.NoError(t, err)
+		require.Equal(t, 1, len(result.Schemas))
+		// We wrote schema for only two predicates
+		if result.Schemas[0].Predicate == "friend" {
+			require.Equal(t, "uid", types.TypeID(result.Schemas[0].ValueType).Name())
+		} else {
+			require.Equal(t, "http://www.w3.org/2000/01/rdf-schema#range",
+				result.Schemas[0].Predicate)
+			require.Equal(t, "uid", types.TypeID(result.Schemas[0].ValueType).Name())
+		}
+		count = len(result.Schemas)
+	}
+	require.NoError(t, scanner.Err())
+	// This order will be preserved due to file naming
+	require.Equal(t, 1, count)
+}
+
+func TestExportRdf(t *testing.T) {
 	// Index the name predicate. We ensure it doesn't show up on export.
 	initTestExport(t, "name:string @index .")
 	// Remove already existing export folders is any.
@@ -110,24 +167,14 @@ func TestExport(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// We have 4 friend type edges. FP("friends")%10 = 2.
-	err = export(bdir, timestamp())
+	x.WorkerConfig.ExportPath = bdir
+	readTs := timestamp()
+	// Do the following so export won't block forever for readTs.
+	posting.Oracle().ProcessDelta(&pb.OracleDelta{MaxAssigned: readTs})
+	err = export(context.Background(), &pb.ExportRequest{ReadTs: readTs, GroupId: 1, Format: "rdf"})
 	require.NoError(t, err)
 
-	searchDir := bdir
-	fileList := []string{}
-	schemaFileList := []string{}
-	err = filepath.Walk(searchDir, func(path string, f os.FileInfo, err error) error {
-		if path != bdir {
-			if strings.Contains(path, "schema") {
-				schemaFileList = append(schemaFileList, path)
-			} else {
-				fileList = append(fileList, path)
-			}
-		}
-		return nil
-	})
-	require.NoError(t, err)
-	require.Equal(t, 1, len(fileList))
+	fileList, schemaFileList := getExportFileList(t, bdir)
 
 	file := fileList[0]
 	f, err := os.Open(file)
@@ -141,37 +188,39 @@ func TestExport(t *testing.T) {
 	for scanner.Scan() {
 		nq, err := rdf.Parse(scanner.Text())
 		require.NoError(t, err)
-		require.Contains(t, []string{"_:uid1", "_:uid2", "_:uid3", "_:uid4", "_:uid5"}, nq.Subject)
+		require.Contains(t, []string{"0x1", "0x2", "0x3", "0x4", "0x5", "0x6"}, nq.Subject)
 		if nq.ObjectValue != nil {
 			switch nq.Subject {
-			case "_:uid1", "_:uid2":
-				require.Equal(t, &api.Value{&api.Value_DefaultVal{"pho\ton"}},
+			case "0x1", "0x2":
+				require.Equal(t, &api.Value{Val: &api.Value_DefaultVal{DefaultVal: "pho\ton"}},
 					nq.ObjectValue)
-			case "_:uid3":
-				require.Equal(t, &api.Value{&api.Value_DefaultVal{"First Line\nSecondLine"}},
+			case "0x3":
+				require.Equal(t, &api.Value{Val: &api.Value_DefaultVal{DefaultVal: "First Line\nSecondLine"}},
 					nq.ObjectValue)
-			case "_:uid4":
-			case "_:uid5":
-				require.Equal(t, `<_:uid5> <name> "" .`, scanner.Text())
+			case "0x4":
+			case "0x5":
+				require.Equal(t, `<0x5> <name> "" .`, scanner.Text())
+			case "0x6":
+				require.Equal(t, `<0x6> <name> "Ding!\u0007Ding!\u0007Ding!\u0007" .`, scanner.Text())
 			default:
 				t.Errorf("Unexpected subject: %v", nq.Subject)
 			}
-			if nq.Subject == "_:uid1" || nq.Subject == "_:uid2" {
-				require.Equal(t, &api.Value{&api.Value_DefaultVal{"pho\ton"}},
+			if nq.Subject == "_:uid1" || nq.Subject == "0x2" {
+				require.Equal(t, &api.Value{Val: &api.Value_DefaultVal{DefaultVal: "pho\ton"}},
 					nq.ObjectValue)
 			}
 		}
 
 		// The only objectId we set was uid 5.
 		if nq.ObjectId != "" {
-			require.Equal(t, "_:uid5", nq.ObjectId)
+			require.Equal(t, "0x5", nq.ObjectId)
 		}
 		// Test lang.
-		if nq.Subject == "_:uid2" && nq.Predicate == "name" {
+		if nq.Subject == "0x2" && nq.Predicate == "name" {
 			require.Equal(t, "en", nq.Lang)
 		}
 		// Test facets.
-		if nq.Subject == "_:uid4" {
+		if nq.Subject == "0x4" {
 			require.Equal(t, "age", nq.Facets[0].Key)
 			require.Equal(t, "close", nq.Facets[1].Key)
 			require.Equal(t, "game", nq.Facets[2].Key)
@@ -190,134 +239,200 @@ func TestExport(t *testing.T) {
 			require.Equal(t, 0, int(nq.Facets[2].ValType))
 			require.Equal(t, 4, int(nq.Facets[4].ValType))
 		}
-		// Test label
-		if nq.Subject != "_:uid3" && nq.Subject != "_:uid5" {
-			require.Equal(t, "author0", nq.Label)
-		} else {
-			require.Equal(t, "", nq.Label)
-		}
+		// Labels have been removed.
 		count++
 	}
 	require.NoError(t, scanner.Err())
 	// This order will be preserved due to file naming.
-	require.Equal(t, 8, count)
+	require.Equal(t, 9, count)
 
-	require.Equal(t, 1, len(schemaFileList))
-	file = schemaFileList[0]
-	f, err = os.Open(file)
-	require.NoError(t, err)
-
-	r, err = gzip.NewReader(f)
-	require.NoError(t, err)
-
-	scanner = bufio.NewScanner(r)
-	count = 0
-	for scanner.Scan() {
-		schemas, err := schema.Parse(scanner.Text())
-		require.NoError(t, err)
-		require.Equal(t, 1, len(schemas))
-		// We wrote schema for only two predicates
-		if schemas[0].Predicate == "friend" {
-			require.Equal(t, "uid", types.TypeID(schemas[0].ValueType).Name())
-		} else {
-			require.Equal(t, "http://www.w3.org/2000/01/rdf-schema#range", schemas[0].Predicate)
-			require.Equal(t, "uid", types.TypeID(schemas[0].ValueType).Name())
-		}
-		count = len(schemas)
-	}
-	require.NoError(t, scanner.Err())
-	// This order will be preserved due to file naming
-	require.Equal(t, 1, count)
+	checkExportSchema(t, schemaFileList)
 }
 
-// func generateBenchValues() []kv {
-// 	byteInt := make([]byte, 4)
-// 	binary.LittleEndian.PutUint32(byteInt, 123)
-//
-// 	fac := []*api.Facet{
-// 		{
-// 			Key:   "facetTest",
-// 			Value: []byte("testVal"),
-// 		},
-// 	}
-//
-// 	geoData, _ := wkb.Marshal(geom.NewPoint(geom.XY).MustSetCoords(geom.Coord{-122.082506, 37.4249518}), binary.LittleEndian)
-//
-// 	// Posting_STRING   Posting_ValType = 0
-// 	// Posting_BINARY   Posting_ValType = 1
-// 	// Posting_INT    Posting_ValType = 2
-// 	// Posting_FLOAT    Posting_ValType = 3
-// 	// Posting_BOOL     Posting_ValType = 4
-// 	// Posting_DATE     Posting_ValType = 5
-// 	// Posting_DATETIME Posting_ValType = 6
-// 	// Posting_GEO      Posting_ValType = 7
-// 	// Posting_UID      Posting_ValType = 8
-// 	benchItems := []kv{
-// 		{
-// 			prefix: "testString",
-// 			list: &intern.PostingList{
-// 				Postings: []*intern.Posting{{
-// 					ValType: intern.Posting_STRING,
-// 					Value:   []byte("手機裡的眼淚"),
-// 					Uid:     uint64(65454),
-// 					Facets:  fac,
-// 				}},
-// 			},
-// 		},
-// 		{prefix: "testGeo",
-// 			list: &intern.PostingList{
-// 				Postings: []*intern.Posting{{
-// 					ValType: intern.Posting_GEO,
-// 					Value:   geoData,
-// 					Uid:     uint64(65454),
-// 					Facets:  fac,
-// 				}},
-// 			}},
-// 		{prefix: "testPassword",
-// 			list: &intern.PostingList{
-// 				Postings: []*intern.Posting{{
-// 					ValType: intern.Posting_PASSWORD,
-// 					Value:   []byte("test"),
-// 					Uid:     uint64(65454),
-// 					Facets:  fac,
-// 				}},
-// 			}},
-// 		{prefix: "testInt",
-// 			list: &intern.PostingList{
-// 				Postings: []*intern.Posting{{
-// 					ValType: intern.Posting_INT,
-// 					Value:   byteInt,
-// 					Uid:     uint64(65454),
-// 					Facets:  fac,
-// 				}},
-// 			}},
-// 		{prefix: "testUid",
-// 			list: &intern.PostingList{
-// 				Postings: []*intern.Posting{{
-// 					ValType: intern.Posting_INT,
-// 					Uid:     uint64(65454),
-// 					Facets:  fac,
-// 				}},
-// 			}},
-// 	}
-//
-// 	return benchItems
-// }
-//
-// func BenchmarkToRDF(b *testing.B) {
-// 	buf := new(bytes.Buffer)
-// 	buf.Grow(50000)
-//
-// 	items := generateBenchValues()
-//
-// 	b.ReportAllocs()
-// 	b.ResetTimer()
-// 	for i := 0; i < b.N; i++ {
-// 		toRDF(buf, items[0])
-// 		toRDF(buf, items[1])
-// 		toRDF(buf, items[2])
-// 		toRDF(buf, items[3])
-// 		toRDF(buf, items[4])
-// 		buf.Reset()
-// 	}
-// }
+func TestExportJson(t *testing.T) {
+	bdir, err := ioutil.TempDir("", "export")
+	require.NoError(t, err)
+	defer os.RemoveAll(bdir)
+
+	time.Sleep(1 * time.Second)
+
+	// We have 4 friend type edges. FP("friends")%10 = 2.
+	x.WorkerConfig.ExportPath = bdir
+	readTs := timestamp()
+	// Do the following so export won't block forever for readTs.
+	posting.Oracle().ProcessDelta(&pb.OracleDelta{MaxAssigned: readTs})
+	req := pb.ExportRequest{ReadTs: readTs, GroupId: 1, Format: "json"}
+	err = export(context.Background(), &req)
+	require.NoError(t, err)
+
+	fileList, schemaFileList := getExportFileList(t, bdir)
+
+	file := fileList[0]
+	f, err := os.Open(file)
+	require.NoError(t, err)
+
+	r, err := gzip.NewReader(f)
+	require.NoError(t, err)
+
+	wantJson := `
+[
+  {"uid":"0x1","name":"pho\ton"},
+  {"uid":"0x2","name@en":"pho\ton"},
+  {"uid":"0x3","name":"First Line\nSecondLine"},
+  {"uid":"0x5","name":""},
+  {"uid":"0x6","name":"Ding!\u0007Ding!\u0007Ding!\u0007"},
+  {"uid":"0x1","friend":[{"uid":"0x5"}]},
+  {"uid":"0x2","friend":[{"uid":"0x5"}]},
+  {"uid":"0x3","friend":[{"uid":"0x5"}]},
+  {"uid":"0x4","friend":[{"uid":"0x5"}],"friend|age":33,"friend|close":"true","friend|game":"football","friend|poem":"roses are red\nviolets are blue","friend|since":"2005-05-02T15:04:05Z"}
+]
+`
+	gotJson, err := ioutil.ReadAll(r)
+	require.NoError(t, err)
+	require.JSONEq(t, wantJson, string(gotJson))
+
+	checkExportSchema(t, schemaFileList)
+}
+
+func TestExportFormat(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "export")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	resp, err := http.Get("http://" + z.SockAddrHttp + "/admin/export?format=json")
+	require.NoError(t, err)
+
+	resp, err = http.Get("http://" + z.SockAddrHttp + "/admin/export?format=rdf")
+	require.NoError(t, err)
+
+	resp, err = http.Get("http://" + z.SockAddrHttp + "/admin/export?format=xml")
+	require.NoError(t, err)
+	require.NotEqual(t, resp.StatusCode, http.StatusOK)
+
+	resp, err = http.Get("http://" + z.SockAddrHttp + "/admin/export?output=rdf")
+	require.NoError(t, err)
+	require.Equal(t, resp.StatusCode, http.StatusOK)
+}
+
+type skv struct {
+	attr   string
+	schema pb.SchemaUpdate
+}
+
+func TestToSchema(t *testing.T) {
+	testCases := []struct {
+		skv      *skv
+		expected string
+	}{
+		{
+			skv: &skv{
+				attr: "Alice",
+				schema: pb.SchemaUpdate{
+					Predicate: "mother",
+					ValueType: pb.Posting_STRING,
+					Directive: pb.SchemaUpdate_REVERSE,
+					List:      false,
+					Count:     true,
+					Upsert:    true,
+					Lang:      true,
+				},
+			},
+			expected: "Alice:string @reverse @count @lang @upsert . \n",
+		},
+		{
+			skv: &skv{
+				attr: "Alice:best",
+				schema: pb.SchemaUpdate{
+					Predicate: "mother",
+					ValueType: pb.Posting_STRING,
+					Directive: pb.SchemaUpdate_REVERSE,
+					List:      false,
+					Count:     false,
+					Upsert:    false,
+					Lang:      true,
+				},
+			},
+			expected: "<Alice:best>:string @reverse @lang . \n",
+		},
+		{
+			skv: &skv{
+				attr: "username/password",
+				schema: pb.SchemaUpdate{
+					Predicate: "",
+					ValueType: pb.Posting_STRING,
+					Directive: pb.SchemaUpdate_NONE,
+					List:      false,
+					Count:     false,
+					Upsert:    false,
+					Lang:      false,
+				},
+			},
+			expected: "<username/password>:string . \n",
+		},
+		{
+			skv: &skv{
+				attr: "B*-tree",
+				schema: pb.SchemaUpdate{
+					Predicate: "",
+					ValueType: pb.Posting_UID,
+					Directive: pb.SchemaUpdate_REVERSE,
+					List:      true,
+					Count:     false,
+					Upsert:    false,
+					Lang:      false,
+				},
+			},
+			expected: "<B*-tree>:[uid] @reverse . \n",
+		},
+		{
+			skv: &skv{
+				attr: "base_de_données",
+				schema: pb.SchemaUpdate{
+					Predicate: "",
+					ValueType: pb.Posting_STRING,
+					Directive: pb.SchemaUpdate_NONE,
+					List:      false,
+					Count:     false,
+					Upsert:    false,
+					Lang:      true,
+				},
+			},
+			expected: "<base_de_données>:string @lang . \n",
+		},
+		{
+			skv: &skv{
+				attr: "data_base",
+				schema: pb.SchemaUpdate{
+					Predicate: "",
+					ValueType: pb.Posting_STRING,
+					Directive: pb.SchemaUpdate_NONE,
+					List:      false,
+					Count:     false,
+					Upsert:    false,
+					Lang:      true,
+				},
+			},
+			expected: "data_base:string @lang . \n",
+		},
+		{
+			skv: &skv{
+				attr: "data.base",
+				schema: pb.SchemaUpdate{
+					Predicate: "",
+					ValueType: pb.Posting_STRING,
+					Directive: pb.SchemaUpdate_NONE,
+					List:      false,
+					Count:     false,
+					Upsert:    false,
+					Lang:      true,
+				},
+			},
+			expected: "data.base:string @lang . \n",
+		},
+	}
+	for _, testCase := range testCases {
+		list, err := toSchema(testCase.skv.attr, testCase.skv.schema)
+		require.NoError(t, err)
+		require.Equal(t, testCase.expected, string(list.Kv[0].Value))
+	}
+}

@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package schema
@@ -25,17 +24,17 @@ import (
 	"github.com/dgraph-io/badger"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 )
 
 type nameType struct {
 	name string
-	typ  *intern.SchemaUpdate
+	typ  *pb.SchemaUpdate
 }
 
-func checkSchema(t *testing.T, h map[string]*intern.SchemaUpdate, expected []nameType) {
+func checkSchema(t *testing.T, h map[string]*pb.SchemaUpdate, expected []nameType) {
 	require.Len(t, h, len(expected))
 	for _, nt := range expected {
 		typ, found := h[nt.name]
@@ -55,25 +54,21 @@ name: string .
 func TestSchema(t *testing.T) {
 	require.NoError(t, ParseBytes([]byte(schemaVal), 1))
 	checkSchema(t, State().predicate, []nameType{
-		{"name", &intern.SchemaUpdate{
+		{"name", &pb.SchemaUpdate{
 			Predicate: "name",
-			ValueType: intern.Posting_STRING,
+			ValueType: pb.Posting_STRING,
 		}},
-		{"_predicate_", &intern.SchemaUpdate{
-			ValueType: intern.Posting_STRING,
-			List:      true,
-		}},
-		{"address", &intern.SchemaUpdate{
+		{"address", &pb.SchemaUpdate{
 			Predicate: "address",
-			ValueType: intern.Posting_STRING,
+			ValueType: pb.Posting_STRING,
 		}},
-		{"http://scalar.com/helloworld/", &intern.SchemaUpdate{
+		{"http://scalar.com/helloworld/", &pb.SchemaUpdate{
 			Predicate: "http://scalar.com/helloworld/",
-			ValueType: intern.Posting_STRING,
+			ValueType: pb.Posting_STRING,
 		}},
-		{"age", &intern.SchemaUpdate{
+		{"age", &pb.SchemaUpdate{
 			Predicate: "age",
-			ValueType: intern.Posting_INT,
+			ValueType: pb.Posting_INT,
 		}},
 	})
 
@@ -81,7 +76,7 @@ func TestSchema(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, types.IntID, typ)
 
-	typ, err = State().TypeOf("agea")
+	_, err = State().TypeOf("agea")
 	require.Error(t, err)
 }
 
@@ -137,15 +132,15 @@ func TestSchemaIndex_Error1(t *testing.T) {
 }
 
 var schemaIndexVal3Uid = `
-person:uid @index .
+person: uid @index .
 `
 
 var schemaIndexVal3Default = `
-value:default @index .
+value: default @index .
 `
 
 var schemaIndexVal3Password = `
-pass:password @index .
+pass: password @index .
 `
 
 // Object types cant be indexed.
@@ -168,40 +163,37 @@ var schemaIndexVal5 = `
 age     : int @index(int) .
 name    : string @index(exact) @count .
 address : string @index(term) .
-friend  : uid @reverse @count .
+friend  : [uid] @reverse @count .
 `
 
 func TestSchemaIndexCustom(t *testing.T) {
 	require.NoError(t, ParseBytes([]byte(schemaIndexVal5), 1))
 	checkSchema(t, State().predicate, []nameType{
-		{"_predicate_", &intern.SchemaUpdate{
-			ValueType: intern.Posting_STRING,
-			List:      true,
-		}},
-		{"name", &intern.SchemaUpdate{
+		{"name", &pb.SchemaUpdate{
 			Predicate: "name",
-			ValueType: intern.Posting_STRING,
+			ValueType: pb.Posting_STRING,
 			Tokenizer: []string{"exact"},
-			Directive: intern.SchemaUpdate_INDEX,
+			Directive: pb.SchemaUpdate_INDEX,
 			Count:     true,
 		}},
-		{"address", &intern.SchemaUpdate{
+		{"address", &pb.SchemaUpdate{
 			Predicate: "address",
-			ValueType: intern.Posting_STRING,
+			ValueType: pb.Posting_STRING,
 			Tokenizer: []string{"term"},
-			Directive: intern.SchemaUpdate_INDEX,
+			Directive: pb.SchemaUpdate_INDEX,
 		}},
-		{"age", &intern.SchemaUpdate{
+		{"age", &pb.SchemaUpdate{
 			Predicate: "age",
-			ValueType: intern.Posting_INT,
+			ValueType: pb.Posting_INT,
 			Tokenizer: []string{"int"},
-			Directive: intern.SchemaUpdate_INDEX,
+			Directive: pb.SchemaUpdate_INDEX,
 		}},
-		{"friend", &intern.SchemaUpdate{
-			ValueType: intern.Posting_UID,
+		{"friend", &pb.SchemaUpdate{
+			ValueType: pb.Posting_UID,
 			Predicate: "friend",
-			Directive: intern.SchemaUpdate_REVERSE,
+			Directive: pb.SchemaUpdate_REVERSE,
 			Count:     true,
+			List:      true,
 		}},
 	})
 	require.True(t, State().IsIndexed("name"))
@@ -218,122 +210,112 @@ func TestParse(t *testing.T) {
 
 func TestParse2(t *testing.T) {
 	reset()
-	schemas, err := Parse("")
+	result, err := Parse("")
 	require.NoError(t, err)
-	require.Nil(t, schemas)
+	require.Nil(t, result.Schemas)
 }
 
 func TestParse3_Error(t *testing.T) {
 	reset()
-	schemas, err := Parse("age:uid @index .")
+	result, err := Parse("age:uid @index .")
 	require.Error(t, err)
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
 func TestParse4_Error(t *testing.T) {
 	reset()
-	schemas, err := Parse("alive:bool @index(geo) .")
-	require.Equal(t, "Tokenizer: geo isn't valid for predicate: alive of type: bool",
-		err.Error())
-	require.Nil(t, schemas)
+	result, err := Parse("alive:bool @index(geo) .")
+	require.Contains(t, err.Error(),
+		"Tokenizer: geo isn't valid for predicate: alive of type: bool")
+	require.Nil(t, result)
 }
 
 func TestParse4_NoError(t *testing.T) {
 	reset()
-	schemas, err := Parse("name:string @index(fulltext) .")
-	require.NotNil(t, schemas)
+	result, err := Parse("name:string @index(fulltext) .")
+	require.NotNil(t, result)
 	require.Nil(t, err)
 }
 
 func TestParse5_Error(t *testing.T) {
 	reset()
-	schemas, err := Parse("value:default @index .")
+	result, err := Parse("value:default @index .")
 	require.Error(t, err)
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
 func TestParse6_Error(t *testing.T) {
 	reset()
-	schemas, err := Parse("pass:password @index .")
+	result, err := Parse("pass:password @index .")
 	require.Error(t, err)
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
 func TestParse7_Error(t *testing.T) {
 	reset()
-	schemas, err := Parse("name:string @index .")
+	result, err := Parse("name:string @index .")
 	require.Error(t, err)
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
 func TestParse8_Error(t *testing.T) {
 	reset()
-	schemas, err := Parse("dob:dateTime @index .")
+	result, err := Parse("dob:dateTime @index .")
 	require.Error(t, err)
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
 func TestParseScalarList(t *testing.T) {
 	reset()
-	schemas, err := Parse(`
+	result, err := Parse(`
 		jobs: [string] @index(term) .
 		occupations: [string] .
 		graduation: [dateTime] .
 	`)
 	require.NoError(t, err)
-	require.Equal(t, 3, len(schemas))
-	require.EqualValues(t, &intern.SchemaUpdate{
+	require.Equal(t, 3, len(result.Schemas))
+	require.EqualValues(t, &pb.SchemaUpdate{
 		Predicate: "jobs",
 		ValueType: 9,
-		Directive: intern.SchemaUpdate_INDEX,
+		Directive: pb.SchemaUpdate_INDEX,
 		Tokenizer: []string{"term"},
 		List:      true,
-	}, schemas[0])
+	}, result.Schemas[0])
 
-	require.EqualValues(t, &intern.SchemaUpdate{
+	require.EqualValues(t, &pb.SchemaUpdate{
 		Predicate: "occupations",
 		ValueType: 9,
 		List:      true,
-	}, schemas[1])
+	}, result.Schemas[1])
 
-	require.EqualValues(t, &intern.SchemaUpdate{
+	require.EqualValues(t, &pb.SchemaUpdate{
 		Predicate: "graduation",
 		ValueType: 5,
 		List:      true,
-	}, schemas[2])
+	}, result.Schemas[2])
 }
 
 func TestParseScalarListError1(t *testing.T) {
 	reset()
-	schemas, err := Parse(`
-		friend: [uid] .
-	`)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected scalar type inside []. Got: [uid] for attr: [friend].")
-	require.Nil(t, schemas)
-}
-
-func TestParseScalarListError2(t *testing.T) {
-	reset()
-	schemas, err := Parse(`
+	result, err := Parse(`
 		friend: [string .
 	`)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unclosed [ while parsing schema for: friend")
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
-func TestParseScalarListError3(t *testing.T) {
+func TestParseScalarListError2(t *testing.T) {
 	reset()
-	schemas, err := Parse(`
+	result, err := Parse(`
 		friend: string] .
 	`)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Invalid ending")
-	require.Nil(t, schemas)
+	require.Nil(t, result)
 }
 
-func TestParseScalarListError4(t *testing.T) {
+func TestParseScalarListError3(t *testing.T) {
 	reset()
 	_, err := Parse(`
 		friend: [bool] .
@@ -342,10 +324,481 @@ func TestParseScalarListError4(t *testing.T) {
 	require.Contains(t, err.Error(), "Unsupported type for list: [bool]")
 }
 
-var ps *badger.ManagedDB
+func TestParseUidList(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		friend: [uid] .
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Schemas))
+	require.EqualValues(t, &pb.SchemaUpdate{
+		Predicate: "friend",
+		ValueType: 7,
+		List:      true,
+	}, result.Schemas[0])
+}
+
+func TestParseUidSingleValue(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		friend: uid .
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Schemas))
+	require.EqualValues(t, &pb.SchemaUpdate{
+		Predicate: "friend",
+		ValueType: 7,
+		List:      false,
+	}, result.Schemas[0])
+}
+func TestParseUnderscore(t *testing.T) {
+	reset()
+	_, err := Parse("_share_:string @index(term) .")
+	require.NoError(t, err)
+}
+
+func TestParseUpsert(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		jobs : string @index(exact) @upsert .
+		age  : int @index(int) @upsert .
+	`)
+	require.NoError(t, err)
+}
+
+func TestParseEmptyType(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+	}, result.Types[0])
+
+}
+
+func TestParseSingleType(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseBaseTypesCaseInsensitive(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string
+			LastName: String
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate: "LastName",
+				ValueType: pb.Posting_STRING,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseCombinedSchemasAndTypes(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+
+		}
+        name: string .
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Schemas))
+	require.Equal(t, &pb.SchemaUpdate{
+		Predicate: "name",
+		ValueType: 9,
+	}, result.Schemas[0])
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+	}, result.Types[0])
+}
+
+func TestParseMultipleTypes(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string
+		}
+		type Animal {
+			Name: string
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+		},
+	}, result.Types[0])
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Animal",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+		},
+	}, result.Types[1])
+}
+
+func TestParseObjectType(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Father: Person
+			Mother: Person
+			Children: [Person]
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate:      "Father",
+				ValueType:      pb.Posting_OBJECT,
+				ObjectTypeName: "Person",
+			},
+			{
+				Predicate:      "Mother",
+				ValueType:      pb.Posting_OBJECT,
+				ObjectTypeName: "Person",
+			},
+			{
+				Predicate:      "Children",
+				ValueType:      pb.Posting_OBJECT,
+				ObjectTypeName: "Person",
+				List:           true,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseScalarType(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string
+			Nickname: [String]
+			Alive: Bool
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate: "Nickname",
+				ValueType: pb.Posting_STRING,
+				List:      true,
+			},
+			{
+				Predicate: "Alive",
+				ValueType: pb.Posting_BOOL,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseCombinedTypes(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string
+			Nickname: [string]
+			Parents: [Person]
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate: "Nickname",
+				ValueType: pb.Posting_STRING,
+				List:      true,
+			},
+			{
+				Predicate:      "Parents",
+				ValueType:      pb.Posting_OBJECT,
+				ObjectTypeName: "Person",
+				List:           true,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseNonNullableScalar(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string!
+			Nickname: [string]
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate:   "Name",
+				ValueType:   pb.Posting_STRING,
+				NonNullable: true,
+			},
+			{
+				Predicate: "Nickname",
+				ValueType: pb.Posting_STRING,
+				List:      true,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseNonNullableList(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string
+			Nickname: [string]!
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate: "Name",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate:       "Nickname",
+				ValueType:       pb.Posting_STRING,
+				List:            true,
+				NonNullableList: true,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseNonNullableScalarAndList(t *testing.T) {
+	reset()
+	result, err := Parse(`
+		type Person {
+			Name: string!
+			Nickname: [string!]!
+		}
+	`)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result.Types))
+	require.Equal(t, &pb.TypeUpdate{
+		TypeName: "Person",
+		Fields: []*pb.SchemaUpdate{
+			{
+				Predicate:   "Name",
+				ValueType:   pb.Posting_STRING,
+				NonNullable: true,
+			},
+			{
+				Predicate:       "Nickname",
+				ValueType:       pb.Posting_STRING,
+				List:            true,
+				NonNullable:     true,
+				NonNullableList: true,
+			},
+		},
+	}, result.Types[0])
+}
+
+func TestParseTypeErrMissingNewLine(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+		}type Animal {}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Expected new line after type declaration")
+}
+
+func TestParseTypeErrMissingColon(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+			Name string
+		}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Missing colon in type declaration")
+}
+
+func TestParseTypeErrMultipleTypes(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+			Name: bool string
+		}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Expected new line after field declaration")
+}
+
+func TestParseTypeErrMultipleExclamationMarks(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+			Name: bool!!
+		}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Expected new line after field declaration")
+}
+
+func TestParseTypeErrMissingSquareBracket(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+			Name: [string
+		}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Expected matching square bracket")
+}
+
+func TestParseTypeErrMultipleSquareBrackets(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+			Name: [[string]]
+		}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Missing field type in type declaration")
+}
+
+func TestParseTypeErrMissingType(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		type Person {
+			Name:
+		}
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Missing field type in type declaration")
+}
+
+func TestParseComments(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		#
+		# This is a test
+		#
+		user: bool .
+		user.name: string @index(exact) . # this should be unique
+		user.email: string @index(exact) . # this should be unique and lower-cased
+		user.password: password .
+		user.code: string . # for password recovery (can be null)
+		node: bool .
+		node.hashid: string @index(exact) . # @username/hashid
+		node.owner: uid @reverse . # (can be null)
+		node.parent: uid . # [uid] (use facet)
+		node.xdata: string . # store custom json data
+		#
+		# End of test
+		#
+	`)
+	require.NoError(t, err)
+}
+
+func TestParseCommentsNoop(t *testing.T) {
+	reset()
+	_, err := Parse(`
+# Spicy jalapeno bacon ipsum dolor amet t-bone kevin spare ribs sausage jowl cow pastrami short.
+# Leberkas alcatra kielbasa chicken pastrami swine bresaola. Spare ribs landjaeger meatloaf.
+# Chicken biltong boudin porchetta jowl swine burgdoggen cow kevin ground round landjaeger ham.
+# Tongue buffalo cow filet mignon boudin sirloin pancetta pork belly beef ribs. Cow landjaeger.
+	`)
+	require.NoError(t, err)
+}
+
+func TestParseCommentsErrMissingType(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		# The definition below should trigger an error
+		# because we commented out its type.
+		node: # bool .
+	`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Missing Type")
+}
+
+func TestParseTypeComments(t *testing.T) {
+	reset()
+	_, err := Parse(`
+		# User is a service user
+		type User {
+			# TODO: add more fields
+			Name: string # e.g., srfrog
+									 # expanded comment
+									 # embedded # comments # here
+		}
+		# /User
+	`)
+	require.NoError(t, err)
+}
+
+var ps *badger.DB
 
 func TestMain(m *testing.M) {
-	x.Init(true)
+	x.Init()
 
 	dir, err := ioutil.TempDir("", "storetest_")
 	x.Check(err)
@@ -361,10 +814,4 @@ func TestMain(m *testing.M) {
 	ps.Close()
 	os.RemoveAll(dir)
 	os.Exit(r)
-}
-
-func TestParseUnderscore(t *testing.T) {
-	reset()
-	_, err := Parse("_share_:string @index(term) .")
-	require.NoError(t, err)
 }

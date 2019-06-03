@@ -6,10 +6,8 @@
 [![Build Status](https://teamcity.dgraph.io/guestAuth/app/rest/builds/buildType:(id:Dgraph_Ci)/statusIcon.svg)](https://teamcity.dgraph.io/viewLog.html?buildTypeId=Dgraph_Ci&buildId=lastFinished&guest=1)
 [![Coverage Status](https://coveralls.io/repos/github/dgraph-io/dgraph/badge.svg?branch=master)](https://coveralls.io/github/dgraph-io/dgraph?branch=master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/dgraph-io/dgraph)](https://goreportcard.com/report/github.com/dgraph-io/dgraph)
-[![Slack Status](http://slack.dgraph.io/badge.svg)](http://slack.dgraph.io)
 
-
-Dgraph is an open source, horizontally scalable and distributed graph database, providing ACID transactions, consistent replication and linearizable reads. It's built from ground up to perform for
+Dgraph is a horizontally scalable and distributed graph database, providing ACID transactions, consistent replication and linearizable reads. It's built from ground up to perform for
 a rich set of queries. Being a native graph database, it tightly controls how the
 data is arranged on disk to optimize for query performance and throughput,
 reducing disk seeks and network calls in a cluster.
@@ -21,7 +19,9 @@ Dgraph supports [GraphQL-like query syntax](https://docs.dgraph.io/master/query-
 
 ## Status
 
-Dgraph is [at version 1.0.0][rel] and is production ready.
+Dgraph is [at version 1.0.x][rel] and is production ready. Apart from the vast open source community, it is being used in
+production at multiple Fortune 500 companies, and by
+[Intuit Katlas](https://github.com/intuit/katlas) and [VMware Purser](https://github.com/vmware/purser).
 
 [rel]: https://github.com/dgraph-io/dgraph/releases
 
@@ -31,6 +31,22 @@ The quickest way to install Dgraph is to run this command on Linux or Mac.
 
 ```bash
 curl https://get.dgraph.io -sSf | bash
+```
+
+## Install with Docker
+
+If you're using Docker, you can use the [official Dgraph image](https://hub.docker.com/r/dgraph/dgraph/).
+
+```bash
+docker pull dgraph/dgraph:latest
+```
+
+## Install from Source
+
+If you want to install from source, you can use `go get` to install to `$GOPATH/bin`.
+
+```bash
+go get -v github.com/dgraph-io/dgraph/dgraph
 ```
 
 ## Get Started
@@ -43,8 +59,8 @@ presentation videos on [YouTube channel](https://www.youtube.com/channel/UCghE41
 
 ## Is Dgraph the right choice for me?
 
-- Do you have more than 10 SQL tables, connected to each other via foreign ids?
-- Do you have sparse data, which doesn't correctly fit into SQL tables?
+- Do you have more than 10 SQL tables, connected to each other via foreign keys?
+- Do you have sparse data, which doesn't elegantly fit into SQL tables?
 - Do you want a simple and flexible schema, which is readable and maintainable
   over time?
 - Do you care about speed and performance at scale?
@@ -59,8 +75,8 @@ makes it easy to build applications with it.
 
 | Features | Dgraph | Neo4j | Janus Graph |
 | -------- | ------ | ----- | ----------- |
-| Architecture | Distributed | Single server | Layer on top of other distributed DBs |
-| Replication | Consistent | None (only available in Enterprise) | Via underlying DB |
+| Architecture | Sharded and Distributed | Single server (+ replicas in enterprise) | Layer on top of other distributed DBs |
+| Replication | Consistent | None in community edition (only available in enterprise) | Via underlying DB |
 | Data movement for shard rebalancing | Automatic | Not applicable (all data lies on each server) | Via underlying DB |
 | Language | GraphQL inspired | Cypher, Gremlin | Gremlin |
 | Protocols | Grpc / HTTP + JSON / RDF | Bolt + Cypher | Websocket / HTTP |
@@ -68,7 +84,7 @@ makes it easy to build applications with it.
 | Full Text Search | Native support | Native support | Via External Indexing System |
 | Regular Expressions | Native support | Native support | Via External Indexing System |
 | Geo Search | Native support | External support only | Via External Indexing System |
-| License | AGPL v3 for server + Apache 2.0 for client | GPL v3 | Apache 2.0 |
+| License | Apache 2.0 | GPL v3 | Apache 2.0 |
 
 ## Users
 - **Dgraph official documentation is present at [docs.dgraph.io](https://docs.dgraph.io).**
@@ -86,13 +102,14 @@ makes it easy to build applications with it.
   channel](https://www.youtube.com/channel/UCghE41LR8nkKFlR3IFTRO4w/featured).
 
 ## Developers
-- See a list of issues [that we need help with](https://github.com/dgraph-io/dgraph/issues?q=is%3Aissue+is%3Aopen+label%3Ahelp_wanted).
-- Please see [contributing to Dgraph](https://docs.dgraph.io/contribute/) for guidelines on contributions.
+- See a list of issues [that we need help with](https://github.com/dgraph-io/dgraph/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+- Please see [Contributing to Dgraph](https://github.com/dgraph-io/dgraph/blob/master/CONTRIBUTING.md) for guidelines on contributions.
 
+## Client Libraries
+The Dgraph team maintain a number of [officially supported client libraries](https://docs.dgraph.io/clients/). There are also libraries contributed by the community [unofficial client libraries](https://docs.dgraph.io/clients#unofficial-dgraph-clients).
 
 ## Contact
 - Please use [discuss.dgraph.io](https://discuss.dgraph.io) for documentation, questions, feature requests and discussions.
 - Please use [Github issue tracker](https://github.com/dgraph-io/dgraph/issues) for filing bugs or feature requests.
 - Join [![Slack Status](http://slack.dgraph.io/badge.svg)](http://slack.dgraph.io).
 - Follow us on Twitter [@dgraphlabs](https://twitter.com/dgraphlabs).
-

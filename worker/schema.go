@@ -1,48 +1,51 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
 
 import (
+	"github.com/pkg/errors"
+	otrace "go.opencensus.io/trace"
 	"golang.org/x/net/context"
-	"golang.org/x/net/trace"
 
+	"github.com/dgraph-io/dgo/protos/api"
 	"github.com/dgraph-io/dgraph/conn"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 )
 
 var (
-	emptySchemaResult intern.SchemaResult
+	emptySchemaResult pb.SchemaResult
 )
 
 type resultErr struct {
-	result *intern.SchemaResult
+	result *pb.SchemaResult
 	err    error
 }
 
 // getSchema iterates over all predicates and populates the asked fields, if list of
 // predicates is not specified, then all the predicates belonging to the group
 // are returned
-func getSchema(ctx context.Context, s *intern.SchemaRequest) (*intern.SchemaResult, error) {
-	var result intern.SchemaResult
+func getSchema(ctx context.Context, s *pb.SchemaRequest) (*pb.SchemaResult, error) {
+	_, span := otrace.StartSpan(ctx, "worker.getSchema")
+	defer span.End()
+
+	var result pb.SchemaResult
 	var predicates []string
 	var fields []string
 	if len(s.Predicates) > 0 {
@@ -53,15 +56,19 @@ func getSchema(ctx context.Context, s *intern.SchemaRequest) (*intern.SchemaResu
 	if len(s.Fields) > 0 {
 		fields = s.Fields
 	} else {
-		fields = []string{"type", "index", "tokenizer", "reverse", "count", "list"}
+		fields = []string{"type", "index", "tokenizer", "reverse", "count", "list", "upsert",
+			"lang"}
 	}
 
 	for _, attr := range predicates {
 		// This can happen after a predicate is moved. We don't delete predicate from schema state
 		// immediately. So lets ignore this predicate.
-		if !groups().ServesTablet(attr) {
+		if servesTablet, err := groups().ServesTabletReadOnly(attr); err != nil {
+			return nil, err
+		} else if !servesTablet {
 			continue
 		}
+
 		if schemaNode := populateSchema(attr, fields); schemaNode != nil {
 			result.Schema = append(result.Schema, schemaNode)
 		}
@@ -95,6 +102,10 @@ func populateSchema(attr string, fields []string) *api.SchemaNode {
 			schemaNode.Count = schema.State().HasCount(attr)
 		case "list":
 			schemaNode.List = schema.State().IsList(attr)
+		case "upsert":
+			schemaNode.Upsert = schema.State().HasUpsert(attr)
+		case "lang":
+			schemaNode.Lang = schema.State().HasLang(attr)
 		default:
 			//pass
 		}
@@ -104,19 +115,26 @@ func populateSchema(attr string, fields []string) *api.SchemaNode {
 
 // addToSchemaMap groups the predicates by group id, if list of predicates is
 // empty then it adds all known groups
-func addToSchemaMap(schemaMap map[uint32]*intern.SchemaRequest, schema *intern.SchemaRequest) {
+func addToSchemaMap(schemaMap map[uint32]*pb.SchemaRequest, schema *pb.SchemaRequest) error {
 	for _, attr := range schema.Predicates {
-		gid := groups().BelongsTo(attr)
+		gid, err := groups().BelongsToReadOnly(attr)
+		if err != nil {
+			return err
+		}
+		if gid == 0 {
+			continue
+		}
+
 		s := schemaMap[gid]
 		if s == nil {
-			s = &intern.SchemaRequest{GroupId: gid}
+			s = &pb.SchemaRequest{GroupId: gid}
 			s.Fields = schema.Fields
 			schemaMap[gid] = s
 		}
 		s.Predicates = append(s.Predicates, attr)
 	}
 	if len(schema.Predicates) > 0 {
-		return
+		return nil
 	}
 	// TODO: Janardhan - node shouldn't serve any request until membership
 	// information is synced, should we fail health check till then ?
@@ -127,17 +145,18 @@ func addToSchemaMap(schemaMap map[uint32]*intern.SchemaRequest, schema *intern.S
 		}
 		s := schemaMap[gid]
 		if s == nil {
-			s = &intern.SchemaRequest{GroupId: gid}
+			s = &pb.SchemaRequest{GroupId: gid}
 			s.Fields = schema.Fields
 			schemaMap[gid] = s
 		}
 	}
+	return nil
 }
 
 // If the current node serves the group serve the schema or forward
 // to relevant node
 // TODO: Janardhan - if read fails try other servers serving same group
-func getSchemaOverNetwork(ctx context.Context, gid uint32, s *intern.SchemaRequest, ch chan resultErr) {
+func getSchemaOverNetwork(ctx context.Context, gid uint32, s *pb.SchemaRequest, ch chan resultErr) {
 	if groups().ServesGroup(gid) {
 		schema, e := getSchema(ctx, s)
 		ch <- resultErr{result: schema, err: e}
@@ -150,32 +169,35 @@ func getSchemaOverNetwork(ctx context.Context, gid uint32, s *intern.SchemaReque
 		return
 	}
 	conn := pl.Get()
-	c := intern.NewWorkerClient(conn)
+	c := pb.NewWorkerClient(conn)
 	schema, e := c.Schema(ctx, s)
 	ch <- resultErr{result: schema, err: e}
 }
 
 // GetSchemaOverNetwork checks which group should be serving the schema
 // according to fingerprint of the predicate and sends it to that instance.
-func GetSchemaOverNetwork(ctx context.Context, schema *intern.SchemaRequest) ([]*api.SchemaNode, error) {
+func GetSchemaOverNetwork(ctx context.Context, schema *pb.SchemaRequest) ([]*api.SchemaNode, error) {
+	ctx, span := otrace.StartSpan(ctx, "worker.GetSchemaOverNetwork")
+	defer span.End()
+
 	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Request rejected %v", err)
-		}
 		return nil, err
 	}
 
+	if len(schema.Predicates) == 0 && len(schema.Types) > 0 {
+		return nil, nil
+	}
+
 	// Map of groupd id => Predicates for that group.
-	schemaMap := make(map[uint32]*intern.SchemaRequest)
-	addToSchemaMap(schemaMap, schema)
+	schemaMap := make(map[uint32]*pb.SchemaRequest)
+	if err := addToSchemaMap(schemaMap, schema); err != nil {
+		return nil, err
+	}
 
 	results := make(chan resultErr, len(schemaMap))
 	var schemaNodes []*api.SchemaNode
 
 	for gid, s := range schemaMap {
-		if gid == 0 {
-			return schemaNodes, errUnservedTablet
-		}
 		go getSchemaOverNetwork(ctx, gid, s, results)
 	}
 
@@ -192,19 +214,44 @@ func GetSchemaOverNetwork(ctx context.Context, schema *intern.SchemaRequest) ([]
 			return nil, ctx.Err()
 		}
 	}
-	close(results)
 
 	return schemaNodes, nil
 }
 
 // Schema is used to get schema information over the network on other instances.
-func (w *grpcWorker) Schema(ctx context.Context, s *intern.SchemaRequest) (*intern.SchemaResult, error) {
+func (w *grpcWorker) Schema(ctx context.Context, s *pb.SchemaRequest) (*pb.SchemaResult, error) {
 	if ctx.Err() != nil {
 		return &emptySchemaResult, ctx.Err()
 	}
 
 	if !groups().ServesGroup(s.GroupId) {
-		return &emptySchemaResult, x.Errorf("This server doesn't serve group id: %v", s.GroupId)
+		return &emptySchemaResult, errors.Errorf("This server doesn't serve group id: %v", s.GroupId)
 	}
 	return getSchema(ctx, s)
+}
+
+// GetTypes processes the type requests and retrieves the desired types.
+func GetTypes(ctx context.Context, req *pb.SchemaRequest) ([]*pb.TypeUpdate, error) {
+	if len(req.Types) == 0 && len(req.Predicates) > 0 {
+		return nil, nil
+	}
+
+	var typeNames []string
+	var out []*pb.TypeUpdate
+
+	if len(req.Types) == 0 {
+		typeNames = schema.State().Types()
+	} else {
+		typeNames = req.Types
+	}
+
+	for _, name := range typeNames {
+		typeUpdate, found := schema.State().GetType(name)
+		if !found {
+			continue
+		}
+		out = append(out, &typeUpdate)
+	}
+
+	return out, nil
 }

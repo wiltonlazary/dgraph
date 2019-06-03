@@ -1,3 +1,19 @@
+/*
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package main
 
 import (
@@ -14,6 +30,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/dgo/protos/api"
+	"github.com/dgraph-io/dgraph/z"
 	"github.com/pkg/errors"
 )
 
@@ -29,12 +47,17 @@ var rootDir = filepath.Join(os.TempDir(), "dgraph_systest")
 
 type suite struct {
 	t *testing.T
-
-	liveCluster *DgraphCluster
-	bulkCluster *DgraphCluster
 }
 
 func newSuite(t *testing.T, schema, rdfs string) *suite {
+	dg := z.DgraphClientWithGroot(z.SockAddr)
+	err := dg.Alter(context.Background(), &api.Operation{
+		DropAll: true,
+	})
+	if err != nil {
+		t.Fatalf("Could not drop old data: %v", err)
+	}
+
 	if testing.Short() {
 		t.Skip("Skipping system test with long runtime.")
 	}
@@ -67,46 +90,36 @@ func (s *suite) setup(schemaFile, rdfFile string) {
 		makeDirEmpty(liveDir),
 	)
 
-	s.bulkCluster = NewDgraphCluster(bulkDir)
-	s.checkFatal(s.bulkCluster.StartZeroOnly())
-
 	bulkCmd := exec.Command(os.ExpandEnv("$GOPATH/bin/dgraph"), "bulk",
-		"-r", rdfFile,
+		"-f", rdfFile,
 		"-s", schemaFile,
-		"--http", ":"+strconv.Itoa(freePort()),
-		"-z", ":"+s.bulkCluster.zeroPort,
+		"--http", "localhost:"+strconv.Itoa(freePort(0)),
 		"-j=1",
 		"-x=true",
+		"-z", z.SockAddrZero,
 	)
-	bulkCmd.Stdout = os.Stdout
-	bulkCmd.Stderr = os.Stdout
 	bulkCmd.Dir = bulkDir
-	if err := bulkCmd.Run(); err != nil {
+	if out, err := bulkCmd.Output(); err != nil {
 		s.cleanup()
+		s.t.Logf("%s", out)
 		s.t.Fatalf("Bulkloader didn't run: %v\n", err)
 	}
-	s.bulkCluster.zero.Process.Kill()
-	s.bulkCluster.zero.Wait()
+
 	s.checkFatal(os.Rename(
 		filepath.Join(bulkDir, "out", "0", "p"),
 		filepath.Join(bulkDir, "p"),
 	))
 
-	s.liveCluster = NewDgraphCluster(liveDir)
-	s.checkFatal(s.liveCluster.Start())
-	s.checkFatal(s.bulkCluster.Start())
-
 	liveCmd := exec.Command(os.ExpandEnv("$GOPATH/bin/dgraph"), "live",
-		"--rdfs", rdfFile,
+		"--files", rdfFile,
 		"--schema", schemaFile,
-		"--dgraph", ":"+s.liveCluster.dgraphPort,
-		"--zero", ":"+s.liveCluster.zeroPort,
+		"--alpha", z.SockAddr,
+		"--zero", z.SockAddrZero,
 	)
 	liveCmd.Dir = liveDir
-	liveCmd.Stdout = os.Stdout
-	liveCmd.Stderr = os.Stdout
-	if err := liveCmd.Run(); err != nil {
+	if out, err := liveCmd.Output(); err != nil {
 		s.cleanup()
+		s.t.Logf("%s", out)
 		s.t.Fatalf("Live Loader didn't run: %v\n", err)
 	}
 }
@@ -121,27 +134,21 @@ func makeDirEmpty(dir string) error {
 func (s *suite) cleanup() {
 	// NOTE: Shouldn't raise any errors here or fail a test, since this is
 	// called when we detect an error (don't want to mask the original problem).
-	if s.liveCluster != nil {
-		s.liveCluster.Close()
-	}
-	if s.bulkCluster != nil {
-		s.bulkCluster.Close()
-	}
 	_ = os.RemoveAll(rootDir)
 }
 
 func (s *suite) testCase(query, wantResult string) func(*testing.T) {
 	return func(t *testing.T) {
-		for _, cluster := range []*DgraphCluster{s.bulkCluster, s.liveCluster} {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			txn := cluster.client.NewTxn()
-			resp, err := txn.Query(ctx, query)
-			if err != nil {
-				t.Fatalf("Could not query: %v", err)
-			}
-			CompareJSON(t, wantResult, string(resp.GetJson()))
+		dg := z.DgraphClientWithGroot(z.SockAddr)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+
+		txn := dg.NewTxn()
+		resp, err := txn.Query(ctx, query)
+		if err != nil {
+			t.Fatalf("Could not query: %v", err)
 		}
+		z.CompareJSON(t, wantResult, string(resp.GetJson()))
 	}
 }
 
@@ -166,16 +173,17 @@ func init() {
 	rand.Seed(int64(time.Now().Nanosecond()))
 }
 
-func freePort() int {
+func freePort(port int) int {
 	// Linux reuses ports in FIFO order. So a port that we listen on and then
 	// release will be free for a long time.
 	for {
-		// p + 7080 and p + 9080 must lie within [20000, 60000]
-		p := 14000 + rand.Intn(30000)
+		// p + 5080 and p + 9080 must lie within [20000, 60000]
+		offset := 15000 + rand.Intn(30000)
+		p := port + offset
 		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
 		if err == nil {
 			listener.Close()
-			return p
+			return offset
 		}
 	}
 }

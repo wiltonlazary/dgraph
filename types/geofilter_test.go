@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"github.com/twpayne/go-geom"
 	"github.com/twpayne/go-geom/encoding/wkb"
@@ -34,7 +34,7 @@ func queryTokens(qt QueryType, data string, maxDistance float64) ([]string, *Geo
 	src.Value = []byte(geoData)
 	gc, err := Convert(src, GeoID)
 	if err != nil {
-		return nil, nil, x.Wrapf(err, "Cannot decode given geoJson input")
+		return nil, nil, errors.Wrapf(err, "Cannot decode given geoJson input")
 	}
 	g := gc.Value.(geom.T)
 
@@ -328,6 +328,7 @@ func TestMatchesFilterIntersectsPolygon(t *testing.T) {
 	data = formDataPolygon(t, polyOut)
 	_, qd, err = queryTokens(QueryTypeIntersects, data, 0.0)
 	require.False(t, qd.MatchesFilter(poly2))
+	require.NoError(t, err)
 
 	// Multipolygon intersects
 	us, err := loadPolygon("testdata/us.json")

@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package zero
@@ -24,32 +23,35 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
+	"go.opencensus.io/plugin/ocgrpc"
+	otrace "go.opencensus.io/trace"
+	"go.opencensus.io/zpages"
 	"golang.org/x/net/context"
+	"golang.org/x/net/trace"
 	"google.golang.org/grpc"
 
 	"github.com/dgraph-io/badger"
-	bopts "github.com/dgraph-io/badger/options"
+	"github.com/dgraph-io/badger/y"
 	"github.com/dgraph-io/dgraph/conn"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/raftwal"
 	"github.com/dgraph-io/dgraph/x"
-	"github.com/gogo/protobuf/jsonpb"
+	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 )
 
 type options struct {
-	bindall     bool
-	myAddr      string
-	portOffset  int
-	nodeId      uint64
-	numReplicas int
-	peer        string
-	w           string
+	bindall           bool
+	myAddr            string
+	portOffset        int
+	nodeId            uint64
+	numReplicas       int
+	peer              string
+	w                 string
+	rebalanceInterval time.Duration
 }
 
 var opts options
@@ -59,9 +61,9 @@ var Zero x.SubCommand
 func init() {
 	Zero.Cmd = &cobra.Command{
 		Use:   "zero",
-		Short: "Run Dgraph zero server",
+		Short: "Run Dgraph Zero",
 		Long: `
-A Dgraph zero instance manages the Dgraph cluster.  Typically, a single Zero
+A Dgraph Zero instance manages the Dgraph cluster.  Typically, a single Zero
 instance is sufficient for the cluster; however, one can run multiple Zero
 instances to achieve high-availability.
 `,
@@ -73,22 +75,30 @@ instances to achieve high-availability.
 	Zero.EnvPrefix = "DGRAPH_ZERO"
 
 	flag := Zero.Cmd.Flags()
-	flag.Bool("bindall", true,
-		"Use 0.0.0.0 instead of localhost to bind to all addresses on local machine.")
 	flag.String("my", "",
-		"addr:port of this server, so other Dgraph servers can talk to this.")
+		"addr:port of this server, so other Dgraph alphas can talk to this.")
 	flag.IntP("port_offset", "o", 0,
-		"Value added to all listening port numbers. [Grpc=7080, HTTP=8080]")
+		"Value added to all listening port numbers. [Grpc=5080, HTTP=6080]")
 	flag.Uint64("idx", 1, "Unique node index for this server.")
 	flag.Int("replicas", 1, "How many replicas to run per data shard."+
 		" The count includes the original shard.")
 	flag.String("peer", "", "Address of another dgraphzero server.")
 	flag.StringP("wal", "w", "zw", "Directory storing WAL.")
+	flag.Duration("rebalance_interval", 8*time.Minute, "Interval for trying a predicate move.")
+	flag.Bool("telemetry", true, "Send anonymous telemetry data to Dgraph devs.")
+
+	// OpenCensus flags.
+	flag.Float64("trace", 1.0, "The ratio of queries to trace.")
+	flag.String("jaeger.collector", "", "Send opencensus traces to Jaeger.")
+	// See https://github.com/DataDog/opencensus-go-exporter-datadog/issues/34
+	// about the status of supporting annotation logs through the datadog exporter
+	flag.String("datadog.collector", "", "Send opencensus traces to Datadog. As of now, the trace"+
+		" exporter does not support annotation logs and would discard them.")
 }
 
 func setupListener(addr string, port int, kind string) (listener net.Listener, err error) {
 	laddr := fmt.Sprintf("%s:%d", addr, port)
-	fmt.Printf("Setting up %s listener at: %v\n", kind, laddr)
+	glog.Infof("Setting up %s listener at: %v\n", kind, laddr)
 	return net.Listen("tcp", laddr)
 }
 
@@ -98,29 +108,35 @@ type state struct {
 	zero *Server
 }
 
-func (st *state) serveGRPC(l net.Listener, wg *sync.WaitGroup) {
+func (st *state) serveGRPC(l net.Listener, store *raftwal.DiskStorage) {
+	x.RegisterExporters(Zero.Conf, "dgraph.zero")
+
 	s := grpc.NewServer(
 		grpc.MaxRecvMsgSize(x.GrpcMaxSize),
 		grpc.MaxSendMsgSize(x.GrpcMaxSize),
-		grpc.MaxConcurrentStreams(1000))
+		grpc.MaxConcurrentStreams(1000),
+		grpc.StatsHandler(&ocgrpc.ServerHandler{}))
 
-	rc := intern.RaftContext{Id: opts.nodeId, Addr: opts.myAddr, Group: 0}
-	m := conn.NewNode(&rc)
-	st.rs = &conn.RaftServer{Node: m}
+	rc := pb.RaftContext{Id: opts.nodeId, Addr: opts.myAddr, Group: 0}
+	m := conn.NewNode(&rc, store)
 
-	st.node = &node{Node: m, ctx: context.Background(), stop: make(chan struct{})}
+	// Zero followers should not be forwarding proposals to the leader, to avoid txn commits which
+	// were calculated in a previous Zero leader.
+	m.Cfg.DisableProposalForwarding = true
+	st.rs = conn.NewRaftServer(m)
+
+	st.node = &node{Node: m, ctx: context.Background(), closer: y.NewCloser(1)}
 	st.zero = &Server{NumReplicas: opts.numReplicas, Node: st.node}
 	st.zero.Init()
 	st.node.server = st.zero
 
-	intern.RegisterZeroServer(s, st.zero)
-	intern.RegisterRaftServer(s, st.rs)
+	pb.RegisterZeroServer(s, st.zero)
+	pb.RegisterRaftServer(s, st.rs)
 
 	go func() {
-		defer wg.Done()
+		defer st.zero.closer.Done()
 		err := s.Serve(l)
-		log.Printf("gRpc server stopped : %s", err.Error())
-		st.node.stop <- struct{}{}
+		glog.Infof("gRPC server stopped : %v", err)
 
 		// Attempt graceful stop (waits for pending RPCs), but force a stop if
 		// it doesn't happen in a reasonable amount of time.
@@ -133,157 +149,125 @@ func (st *state) serveGRPC(l net.Listener, wg *sync.WaitGroup) {
 		select {
 		case <-done:
 		case <-time.After(timeout):
-			log.Printf("Stopping grpc gracefully is taking longer than %v."+
+			glog.Infof("Stopping grpc gracefully is taking longer than %v."+
 				" Force stopping now. Pending RPCs will be abandoned.", timeout)
 			s.Stop()
 		}
 	}()
 }
 
-func (st *state) serveHTTP(l net.Listener, wg *sync.WaitGroup) {
-	srv := &http.Server{
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 600 * time.Second,
-		IdleTimeout:  2 * time.Minute,
-	}
-
-	go func() {
-		defer wg.Done()
-		err := srv.Serve(l)
-		log.Printf("Stopped taking more http(s) requests. Err: %s", err.Error())
-		ctx, cancel := context.WithTimeout(context.Background(), 630*time.Second)
-		defer cancel()
-		err = srv.Shutdown(ctx)
-		log.Printf("All http(s) requests finished.")
-		if err != nil {
-			log.Printf("Http(s) shutdown err: %v", err.Error())
-		}
-	}()
-}
-
-func intFromQueryParam(w http.ResponseWriter, r *http.Request, name string) (uint64, bool) {
-	str := r.URL.Query().Get(name)
-	if len(str) == 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, fmt.Sprintf("%s not passed", name))
-		return 0, false
-	}
-	val, err := strconv.ParseUint(str, 0, 64)
-	if err != nil {
-		x.SetStatus(w, x.ErrorInvalidRequest, fmt.Sprintf("Error while parsing %s", name))
-		return 0, false
-	}
-	return val, true
-}
-
-func (st *state) removeNode(w http.ResponseWriter, r *http.Request) {
-	x.AddCorsHeaders(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusBadRequest)
-		x.SetStatus(w, x.ErrorInvalidMethod, "Invalid method")
-		return
-	}
-
-	nodeId, ok := intFromQueryParam(w, r, "id")
-	if !ok {
-		return
-	}
-	groupId, ok := intFromQueryParam(w, r, "group")
-	if !ok {
-		return
-	}
-	if err := st.zero.removeNode(context.Background(), nodeId, uint32(groupId)); err != nil {
-		x.SetStatus(w, x.Error, err.Error())
-		return
-	}
-	return
-}
-
-func (st *state) getState(w http.ResponseWriter, r *http.Request) {
-	x.AddCorsHeaders(w)
-	w.Header().Set("Content-Type", "application/json")
-
-	mstate := st.zero.membershipState()
-	if mstate == nil {
-		x.SetStatus(w, x.ErrorNoData, "No membership state found.")
-		return
-	}
-
-	m := jsonpb.Marshaler{}
-	if err := m.Marshal(w, mstate); err != nil {
-		x.SetStatus(w, x.ErrorNoData, err.Error())
-		return
-	}
-}
-
 func run() {
+	x.PrintVersion()
 	opts = options{
-		bindall:     Zero.Conf.GetBool("bindall"),
-		myAddr:      Zero.Conf.GetString("my"),
-		portOffset:  Zero.Conf.GetInt("port_offset"),
-		nodeId:      uint64(Zero.Conf.GetInt("idx")),
-		numReplicas: Zero.Conf.GetInt("replicas"),
-		peer:        Zero.Conf.GetString("peer"),
-		w:           Zero.Conf.GetString("wal"),
+		bindall:           Zero.Conf.GetBool("bindall"),
+		myAddr:            Zero.Conf.GetString("my"),
+		portOffset:        Zero.Conf.GetInt("port_offset"),
+		nodeId:            uint64(Zero.Conf.GetInt("idx")),
+		numReplicas:       Zero.Conf.GetInt("replicas"),
+		peer:              Zero.Conf.GetString("peer"),
+		w:                 Zero.Conf.GetString("wal"),
+		rebalanceInterval: Zero.Conf.GetDuration("rebalance_interval"),
 	}
 
+	if opts.numReplicas < 0 || opts.numReplicas%2 == 0 {
+		log.Fatalf("ERROR: Number of replicas must be odd for consensus. Found: %d",
+			opts.numReplicas)
+	}
+
+	if Zero.Conf.GetBool("expose_trace") {
+		// TODO: Remove this once we get rid of event logs.
+		trace.AuthRequest = func(req *http.Request) (any, sensitive bool) {
+			return true, true
+		}
+	}
 	grpc.EnableTracing = false
+	otrace.ApplyConfig(otrace.Config{
+		DefaultSampler: otrace.ProbabilitySampler(Zero.Conf.GetFloat64("trace"))})
 
 	addr := "localhost"
 	if opts.bindall {
 		addr = "0.0.0.0"
 	}
 	if len(opts.myAddr) == 0 {
-		opts.myAddr = fmt.Sprintf("localhost:%d", x.PortInternal+opts.portOffset)
+		opts.myAddr = fmt.Sprintf("localhost:%d", x.PortZeroGrpc+opts.portOffset)
 	}
-	grpcListener, err := setupListener(addr, x.PortInternal+opts.portOffset, "grpc")
+	grpcListener, err := setupListener(addr, x.PortZeroGrpc+opts.portOffset, "grpc")
 	if err != nil {
 		log.Fatal(err)
 	}
-	httpListener, err := setupListener(addr, x.PortHTTP+opts.portOffset, "http")
+	httpListener, err := setupListener(addr, x.PortZeroHTTP+opts.portOffset, "http")
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	var wg sync.WaitGroup
-	wg.Add(3)
-	// Initialize the servers.
-	var st state
-	st.serveGRPC(grpcListener, &wg)
-	st.serveHTTP(httpListener, &wg)
-
-	http.HandleFunc("/state", st.getState)
-	http.HandleFunc("/removeNode", st.removeNode)
 
 	// Open raft write-ahead log and initialize raft node.
 	x.Checkf(os.MkdirAll(opts.w, 0700), "Error while creating WAL dir.")
-	kvOpt := badger.DefaultOptions
-	kvOpt.SyncWrites = true
+	kvOpt := badger.LSMOnlyOptions
+	kvOpt.SyncWrites = false
+	kvOpt.Truncate = true
 	kvOpt.Dir = opts.w
 	kvOpt.ValueDir = opts.w
-	kvOpt.TableLoadingMode = bopts.MemoryMap
-	kv, err := badger.OpenManaged(kvOpt)
+	kvOpt.ValueLogFileSize = 64 << 20
+	kv, err := badger.Open(kvOpt)
 	x.Checkf(err, "Error while opening WAL store")
 	defer kv.Close()
-	wal := raftwal.Init(kv, opts.nodeId)
-	x.Check(st.node.initAndStartNode(wal))
+	store := raftwal.Init(kv, opts.nodeId, 0)
+
+	// Initialize the servers.
+	var st state
+	st.serveGRPC(grpcListener, store)
+	st.serveHTTP(httpListener)
+
+	http.HandleFunc("/state", st.getState)
+	http.HandleFunc("/removeNode", st.removeNode)
+	http.HandleFunc("/moveTablet", st.moveTablet)
+	http.HandleFunc("/assign", st.assign)
+	zpages.Handle(http.DefaultServeMux, "/z")
+
+	// This must be here. It does not work if placed before Grpc init.
+	x.Check(st.node.initAndStartNode())
+
+	if Zero.Conf.GetBool("telemetry") {
+		go st.zero.periodicallyPostTelemetry()
+	}
 
 	sdCh := make(chan os.Signal, 1)
 	signal.Notify(sdCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
+	// handle signals
 	go func() {
-		defer wg.Done()
-		<-sdCh
-		fmt.Println("Shutting down...")
-		// Close doesn't close already opened connections.
-		httpListener.Close()
-		grpcListener.Close()
-		close(st.zero.shutDownCh)
+		for {
+			select {
+			case sig, ok := <-sdCh:
+				if !ok {
+					return
+				}
+				glog.Infof("--- Received %s signal", sig)
+				signal.Stop(sdCh)
+				st.zero.closer.Signal()
+			}
+		}
 	}()
 
-	fmt.Println("Running Dgraph zero...")
-	wg.Wait()
-	fmt.Println("All done.")
+	st.zero.closer.AddRunning(1)
+
+	go func() {
+		defer st.zero.closer.Done()
+		<-st.zero.closer.HasBeenClosed()
+		glog.Infoln("Shutting down...")
+		close(sdCh)
+		// Close doesn't close already opened connections.
+
+		// Stop all HTTP requests.
+		httpListener.Close()
+		// Stop Raft.
+		st.node.closer.SignalAndWait()
+		// Stop all internal requests.
+		grpcListener.Close()
+		st.node.trySnapshot(0)
+	}()
+
+	glog.Infoln("Running Dgraph Zero...")
+	st.zero.closer.Wait()
+	glog.Infoln("All done.")
 }

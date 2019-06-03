@@ -1,3 +1,19 @@
+/*
+ * Copyright 2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package main
 
 import (
@@ -12,9 +28,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/dgraph/client"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/dgo"
+	"github.com/dgraph-io/dgo/protos/api"
+	"github.com/dgraph-io/dgo/x"
 	"google.golang.org/grpc"
 )
 
@@ -118,21 +134,21 @@ func initialData() string {
 	return rdfs
 }
 
-func makeClient() *client.Dgraph {
+func makeClient() *dgo.Dgraph {
 	var dgcs []api.DgraphClient
 	for _, addr := range strings.Split(*addrs, ",") {
 		c, err := grpc.Dial(addr, grpc.WithInsecure())
 		x.Check(err)
 		dgcs = append(dgcs, api.NewDgraphClient(c))
 	}
-	return client.NewDgraphClient(dgcs...)
+	return dgo.NewDgraphClient(dgcs...)
 }
 
 type runner struct {
-	txn *client.Txn
+	txn *dgo.Txn
 }
 
-func mutate(c *client.Dgraph) error {
+func mutate(c *dgo.Dgraph) error {
 	r := &runner{
 		txn: c.NewTxn(),
 	}
@@ -184,7 +200,7 @@ func mutate(c *client.Dgraph) error {
 	return r.txn.Commit(ctx)
 }
 
-func showNode(c *client.Dgraph) error {
+func showNode(c *dgo.Dgraph) error {
 	r := &runner{
 		txn: c.NewTxn(),
 	}
@@ -215,16 +231,13 @@ func showNode(c *client.Dgraph) error {
 	x.AssertTruef(len(result.Q) > 0 && result.Q[0].Count != nil, "%v %+v", string(resp.Json), result)
 
 	var m map[string]interface{}
-	if err := r.query(&m, `
+	return r.query(&m, `
 	{
 		q(func: eq(xid, "%c_%d")) {
 			expand(_all_)
 		}
 	}
-	`, char, rand.Intn(*result.Q[0].Count)); err != nil {
-		return err
-	}
-	return nil
+	`, char, rand.Intn(*result.Q[0].Count))
 }
 
 func (r *runner) query(out interface{}, q string, args ...interface{}) error {

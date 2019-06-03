@@ -1,59 +1,64 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package gql
 
 import (
+	"github.com/dgraph-io/dgo/protos/api"
 	"github.com/dgraph-io/dgraph/lex"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 func ParseMutation(mutation string) (*api.Mutation, error) {
-	lexer := lex.Lexer{Input: mutation}
+	lexer := lex.NewLexer(mutation)
 	lexer.Run(lexInsideMutation)
 	it := lexer.NewIterator()
-	var mu *api.Mutation
+	var mu api.Mutation
+
+	if !it.Next() {
+		return nil, errors.New("Invalid mutation")
+	}
+	item := it.Item()
+	if item.Typ != itemLeftCurl {
+		return nil, errors.Errorf("Expected { at the start of block. Got: [%s]", item.Val)
+	}
+
 	for it.Next() {
 		item := it.Item()
 		if item.Typ == itemText {
 			continue
 		}
-		if item.Typ == itemLeftCurl {
-			mu = new(api.Mutation)
-		}
 		if item.Typ == itemRightCurl {
-			return mu, nil
+			// mutations must be enclosed in a single block.
+			if it.Next() && it.Item().Typ != lex.ItemEOF {
+				return nil, errors.Errorf("Unexpected %s after the end of the block.", it.Item().Val)
+			}
+			return &mu, nil
 		}
 		if item.Typ == itemMutationOp {
-			if err := parseMutationOp(it, item.Val, mu); err != nil {
+			if err := parseMutationOp(it, item.Val, &mu); err != nil {
 				return nil, err
 			}
 		}
 	}
-	return nil, x.Errorf("Invalid mutation.")
+	return nil, errors.Errorf("Invalid mutation.")
 }
 
 // parseMutationOp parses and stores set or delete operation string in Mutation.
 func parseMutationOp(it *lex.ItemIterator, op string, mu *api.Mutation) error {
-	if mu == nil {
-		return x.Errorf("Mutation is nil.")
-	}
-
 	parse := false
 	for it.Next() {
 		item := it.Item()
@@ -62,29 +67,29 @@ func parseMutationOp(it *lex.ItemIterator, op string, mu *api.Mutation) error {
 		}
 		if item.Typ == itemLeftCurl {
 			if parse {
-				return x.Errorf("Too many left curls in set mutation.")
+				return errors.Errorf("Too many left curls in set mutation.")
 			}
 			parse = true
 		}
 		if item.Typ == itemMutationContent {
 			if !parse {
-				return x.Errorf("Mutation syntax invalid.")
+				return errors.Errorf("Mutation syntax invalid.")
 			}
 			if op == "set" {
 				mu.SetNquads = []byte(item.Val)
 			} else if op == "delete" {
 				mu.DelNquads = []byte(item.Val)
 			} else if op == "schema" {
-				return x.Errorf("Altering schema not supported through http client.")
+				return errors.Errorf("Altering schema not supported through http client.")
 			} else if op == "dropall" {
-				return x.Errorf("Dropall not supported through http client.")
+				return errors.Errorf("Dropall not supported through http client.")
 			} else {
-				return x.Errorf("Invalid mutation operation.")
+				return errors.Errorf("Invalid mutation operation.")
 			}
 		}
 		if item.Typ == itemRightCurl {
 			return nil
 		}
 	}
-	return x.Errorf("Invalid mutation formatting.")
+	return errors.Errorf("Invalid mutation formatting.")
 }

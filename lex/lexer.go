@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2015-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package lex
@@ -22,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 const EOF = -1
@@ -40,16 +40,23 @@ const (
 type StateFn func(*Lexer) StateFn
 
 type Item struct {
-	Typ ItemType
-	Val string
+	Typ    ItemType
+	Val    string
+	line   int
+	column int
+}
+
+func (i Item) Errorf(format string, args ...interface{}) error {
+	return fmt.Errorf("line %d column %d: "+format,
+		append([]interface{}{i.line, i.column}, args...)...)
 }
 
 func (i Item) String() string {
 	switch i.Typ {
-	case 0:
+	case ItemEOF:
 		return "EOF"
 	}
-	return fmt.Sprintf("lex.Item [%v] %q", i.Typ, i.Val)
+	return fmt.Sprintf("lex.Item [%v] %q at %d:%d", i.Typ, i.Val, i.line, i.column)
 }
 
 type ItemIterator struct {
@@ -65,6 +72,11 @@ func (l *Lexer) NewIterator() *ItemIterator {
 	return it
 }
 
+func (p *ItemIterator) Errorf(format string, args ...interface{}) error {
+	nextItem, _ := p.PeekOne()
+	return nextItem.Errorf(format, args...)
+}
+
 // Next advances the iterator by one.
 func (p *ItemIterator) Next() bool {
 	p.idx++
@@ -77,7 +89,10 @@ func (p *ItemIterator) Next() bool {
 // Item returns the current item.
 func (p *ItemIterator) Item() Item {
 	if p.idx < 0 || p.idx >= len(p.l.items) {
-		return Item{}
+		return Item{
+			line:   -1, // using negative numbers to indicate out-of-range item
+			column: -1,
+		}
 	}
 	return (p.l.items)[p.idx]
 }
@@ -105,7 +120,7 @@ func (p *ItemIterator) Save() int {
 // Peek returns the next n items without consuming them.
 func (p *ItemIterator) Peek(num int) ([]Item, error) {
 	if (p.idx + num + 1) > len(p.l.items) {
-		return nil, x.Errorf("Out of range for peek")
+		return nil, errors.Errorf("Out of range for peek")
 	}
 	return p.l.items[p.idx+1 : p.idx+num+1], nil
 }
@@ -113,29 +128,73 @@ func (p *ItemIterator) Peek(num int) ([]Item, error) {
 // PeekOne returns the next 1 item without consuming it.
 func (p *ItemIterator) PeekOne() (Item, bool) {
 	if p.idx+1 >= len(p.l.items) {
-		return Item{}, false
+		return Item{
+			line:   -1,
+			column: -1, // use negative number to indicate out of range
+		}, false
 	}
 	return p.l.items[p.idx+1], true
+}
+
+// A RuneWidth represents a consecutive string of runes with the same width
+// and the number of runes is stored in count.
+// The reason we maintain this information is to properly backup when multiple look-aheads happen.
+// For example, if the following sequence of events happen
+// 1. Lexer.Next() consumes 1 byte
+// 2. Lexer.Next() consumes 1 byte
+// 3. Lexer.Next() consumes 3 bytes
+// we would create two RunWidthTrackers, the 1st having width 1 and count 2, while the 2nd having
+// width 3 and count 1, then the following backups can be done properly:
+// 4. Lexer.Backup() should decrement the pos by 3
+// 5. Lexer.Backup() should decrement the pos by 1
+// 6. Lexer.Backup() should decrement the pos by 1
+type RuneWidth struct {
+	width int
+	// count should be always greater than or equal to 1, because we pop a tracker item
+	// from the stack when count is about to reach 0
+	count int
 }
 
 type Lexer struct {
 	// NOTE: Using a text scanner wouldn't work because it's designed for parsing
 	// Golang. It won't keep track of Start Position, or allow us to retrieve
 	// slice from [Start:Pos]. Better to just use normal string.
-	Input    string  // string being scanned.
-	Start    int     // Start Position of this item.
-	Pos      int     // current Position of this item.
-	Width    int     // Width of last rune read from input.
-	items    []Item  // channel of scanned items.
-	Depth    int     // nesting of {}
-	ArgDepth int     // nesting of ()
-	Mode     StateFn // Default state to go back to after reading a token.
+	Input      string // string being scanned.
+	Start      int    // Start Position of this item.
+	Pos        int    // current Position of this item.
+	Width      int    // Width of last rune read from input.
+	widthStack []*RuneWidth
+	items      []Item  // channel of scanned items.
+	Depth      int     // nesting of {}
+	ArgDepth   int     // nesting of ()
+	Mode       StateFn // Default state to go back to after reading a token.
+	Line       int     // the current line number corresponding to Start
+	Column     int     // the current column number corresponding to Start
+}
+
+func NewLexer(input string) *Lexer {
+	return &Lexer{
+		Input:  input,
+		Line:   1,
+		Column: 0,
+	}
+}
+
+func (l *Lexer) ValidateResult() error {
+	it := l.NewIterator()
+	for it.Next() {
+		item := it.Item()
+		if item.Typ == ItemError {
+			return errors.New(item.Val)
+		}
+	}
+	return nil
 }
 
 func (l *Lexer) Run(f StateFn) *Lexer {
 	for state := f; state != nil; {
 		// The following statement is useful for debugging.
-		// fmt.Printf("Func: %v\n", runtime.FuncForPC(reflect.ValueOf(state).Pointer()).Name())
+		//fmt.Printf("Func: %v\n", runtime.FuncForPC(reflect.ValueOf(state).Pointer()).Name())
 		state = state(l)
 	}
 	return l
@@ -145,7 +204,10 @@ func (l *Lexer) Run(f StateFn) *Lexer {
 func (l *Lexer) Errorf(format string, args ...interface{}) StateFn {
 	l.items = append(l.items, Item{
 		Typ: ItemError,
-		Val: fmt.Sprintf("while lexing %v: "+format, append([]interface{}{l.Input}, args...)...),
+		Val: fmt.Sprintf("while lexing %v at line %d column %d: "+format,
+			append([]interface{}{l.Input, l.Line, l.Column}, args...)...),
+		line:   l.Line,
+		column: l.Column,
 	})
 	return nil
 }
@@ -157,26 +219,49 @@ func (l *Lexer) Emit(t ItemType) {
 		return
 	}
 	l.items = append(l.items, Item{
-		Typ: t,
-		Val: l.Input[l.Start:l.Pos],
+		Typ:    t,
+		Val:    l.Input[l.Start:l.Pos],
+		line:   l.Line,
+		column: l.Column,
 	})
-	l.Start = l.Pos
+	l.moveStartToPos()
+}
+
+func (l *Lexer) pushWidth(width int) {
+	wl := len(l.widthStack)
+	if wl == 0 || l.widthStack[wl-1].width != width {
+		l.widthStack = append(l.widthStack, &RuneWidth{
+			count: 1,
+			width: width,
+		})
+	} else {
+		l.widthStack[wl-1].count++
+	}
 }
 
 // Next reads the next rune from the Input, sets the Width and advances Pos.
 func (l *Lexer) Next() (result rune) {
 	if l.Pos >= len(l.Input) {
-		l.Width = 0
+		l.pushWidth(0)
 		return EOF
 	}
 	r, w := utf8.DecodeRuneInString(l.Input[l.Pos:])
-	l.Width = w
-	l.Pos += l.Width
+	l.pushWidth(w)
+	l.Pos += w
 	return r
 }
 
 func (l *Lexer) Backup() {
-	l.Pos -= l.Width
+	wl := len(l.widthStack)
+	x.AssertTruef(wl > 0,
+		"Backup should not be called when the width tracker stack is empty")
+	rw := l.widthStack[wl-1]
+	if rw.count == 1 {
+		l.widthStack = l.widthStack[:wl-1] // pop the item from the stack
+	} else {
+		rw.count--
+	}
+	l.Pos -= rw.width
 }
 
 func (l *Lexer) Peek() rune {
@@ -185,8 +270,23 @@ func (l *Lexer) Peek() rune {
 	return r
 }
 
-func (l *Lexer) Ignore() {
+func (l *Lexer) moveStartToPos() {
+	// check if we are about to move Start to a new line
+	for offset := l.Start; offset < l.Pos; {
+		r, w := utf8.DecodeRuneInString(l.Input[offset:l.Pos])
+		offset += w
+		if IsEndOfLine(r) {
+			l.Line++
+			l.Column = 0
+		} else {
+			l.Column += w
+		}
+	}
 	l.Start = l.Pos
+}
+
+func (l *Lexer) Ignore() {
+	l.moveStartToPos()
 }
 
 // CheckRune is predicate signature for accepting valid runes on input.
@@ -197,7 +297,7 @@ type CheckRune func(r rune) bool
 type CheckRuneRec func(r rune, l *Lexer) bool
 
 // AcceptRun accepts tokens based on CheckRune
-// untill it returns false or EOF is reached.
+// until it returns false or EOF is reached.
 // Returns last rune accepted and valid flag for rune.
 func (l *Lexer) AcceptRun(c CheckRune) (lastr rune, validr bool) {
 	validr = false
@@ -214,7 +314,7 @@ func (l *Lexer) AcceptRun(c CheckRune) (lastr rune, validr bool) {
 }
 
 // AcceptRunRec accepts tokens based on CheckRuneRec
-// untill it returns false or EOF is reached.
+// until it returns false or EOF is reached.
 func (l *Lexer) AcceptRunRec(c CheckRuneRec) {
 	for {
 		r := l.Next()
@@ -260,30 +360,35 @@ const (
 	quote = '"'
 )
 
-// ECHAR ::= '\' [tbnrf"'\]
+// ECHAR ::= '\' [vtbnrf"'\]
 func (l *Lexer) IsEscChar(r rune) bool {
 	switch r {
-	case 't', 'b', 'n', 'r', 'f', '"', '\'', '\\':
+	case 'v', 't', 'b', 'n', 'r', 'f', '"', '\'', '\\':
 		return true
 	}
 	return false
+}
+
+// IsEndOfLine returns true if the rune is a Linefeed or a Carriage return.
+func IsEndOfLine(r rune) bool {
+	return r == '\u000A' || r == '\u000D'
 }
 
 func (l *Lexer) LexQuotedString() error {
 	l.Backup()
 	r := l.Next()
 	if r != quote {
-		return x.Errorf("String should start with quote.")
+		return errors.Errorf("String should start with quote.")
 	}
 	for {
 		r := l.Next()
 		if r == EOF {
-			return x.Errorf("Unexpected end of input.")
+			return errors.Errorf("Unexpected end of input.")
 		}
 		if r == '\\' {
 			r := l.Next()
 			if !l.IsEscChar(r) {
-				return x.Errorf("Not a valid escape char: '%c'", r)
+				return errors.Errorf("Not a valid escape char: '%c'", r)
 			}
 			continue // eat the next char
 		}

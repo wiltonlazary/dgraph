@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,17 +24,22 @@ import (
 
 var (
 	healthCheck uint32
-	memoryCheck uint32
-	memoryErr   = errors.New("Please retry again, server's memory is at capacity")
-	healthErr   = errors.New("Please retry again, server is not ready to accept requests")
+	errHealth   = errors.New("Please retry again, server is not ready to accept requests")
 )
 
-func UpdateMemoryStatus(ok bool) {
-	setStatus(&memoryCheck, ok)
-}
-
+// UpdateHealthStatus updates the server's health status so it can start accepting requests.
 func UpdateHealthStatus(ok bool) {
 	setStatus(&healthCheck, ok)
+}
+
+// HealthCheck returns whether the server is ready to accept requests or not
+// Load balancer would add the node to the endpoint once health check starts
+// returning true
+func HealthCheck() error {
+	if atomic.LoadUint32(&healthCheck) == 0 {
+		return errHealth
+	}
+	return nil
 }
 
 func setStatus(v *uint32, ok bool) {
@@ -43,21 +48,4 @@ func setStatus(v *uint32, ok bool) {
 	} else {
 		atomic.StoreUint32(v, 0)
 	}
-}
-
-// HealthCheck returns whether the server is ready to accept requests or not
-// Load balancer would add the node to the endpoint once health check starts
-// returning true
-func HealthCheck() error {
-	if atomic.LoadUint32(&memoryCheck) == 0 {
-		return memoryErr
-	}
-	if atomic.LoadUint32(&healthCheck) == 0 {
-		return healthErr
-	}
-	return nil
-}
-
-func init() {
-	memoryCheck = 1
 }

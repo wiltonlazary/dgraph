@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2015-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 // Package gql is responsible for lexing and parsing a GraphQL query/mutation.
@@ -29,16 +28,13 @@ const (
 	rightSquare = ']'
 	period      = '.'
 	comma       = ','
-	bang        = '!'
-	dollar      = '$'
 	slash       = '/'
-	backslash   = '\\'
 	equal       = '='
 	quote       = '"'
 	at          = '@'
 	colon       = ':'
 	lsThan      = '<'
-	grThan      = '>'
+	star        = '*'
 )
 
 // Constants representing type of different graphql lexed items.
@@ -49,7 +45,6 @@ const (
 	itemEqual                                   // equals to symbol
 	itemName                                    // [9] names
 	itemOpType                                  // operation type
-	itemString                                  // quoted string
 	itemLeftRound                               // left round bracket
 	itemRightRound                              // right round bracket
 	itemColon                                   // Colon
@@ -57,7 +52,6 @@ const (
 	itemPeriod                                  // .
 	itemDollar                                  // $
 	itemRegex                                   // /
-	itemBackslash                               // \
 	itemMutationOp                              // mutation operation
 	itemMutationContent                         // mutation content
 	itemLeftSquare
@@ -82,7 +76,7 @@ func lexInsideMutation(l *lex.Lexer) lex.StateFn {
 			if l.Depth >= 2 {
 				return lexTextMutation
 			}
-		case isSpace(r) || isEndOfLine(r):
+		case isSpace(r) || lex.IsEndOfLine(r):
 			l.Ignore()
 		case isNameBegin(r):
 			return lexNameMutation
@@ -117,7 +111,7 @@ func lexInsideSchema(l *lex.Lexer) lex.StateFn {
 			l.Emit(itemLeftSquare)
 		case r == rightSquare:
 			l.Emit(itemRightSquare)
-		case isSpace(r) || isEndOfLine(r):
+		case isSpace(r) || lex.IsEndOfLine(r):
 			l.Ignore()
 		case isNameBegin(r):
 			return lexArgName
@@ -189,7 +183,7 @@ func lexFuncOrArg(l *lex.Lexer) lex.StateFn {
 			}
 		case r == lex.EOF:
 			return l.Errorf("Unclosed Brackets")
-		case isSpace(r) || isEndOfLine(r):
+		case isSpace(r) || lex.IsEndOfLine(r):
 			l.Ignore()
 		case r == comma:
 			if empty {
@@ -225,7 +219,7 @@ func lexFuncOrArg(l *lex.Lexer) lex.StateFn {
 		case r == '.':
 			l.Emit(itemPeriod)
 		default:
-			return l.Errorf("Unrecognized character in inside a func: %#U", r)
+			return l.Errorf("Unrecognized character inside a func: %#U", r)
 		}
 	}
 }
@@ -252,7 +246,7 @@ Loop:
 			l.Emit(itemLeftRound)
 			l.ArgDepth++
 			return lexQuery
-		case isSpace(r) || isEndOfLine(r):
+		case isSpace(r) || lex.IsEndOfLine(r):
 			l.Ignore()
 		case isNameBegin(r):
 			l.Backup()
@@ -284,7 +278,7 @@ func lexQuery(l *lex.Lexer) lex.StateFn {
 			l.Emit(itemLeftCurl)
 		case r == lex.EOF:
 			return l.Errorf("Unclosed action")
-		case isSpace(r) || isEndOfLine(r):
+		case isSpace(r) || lex.IsEndOfLine(r):
 			l.Ignore()
 		case r == comma:
 			l.Emit(itemComma)
@@ -314,23 +308,8 @@ func lexQuery(l *lex.Lexer) lex.StateFn {
 }
 
 func lexIRIRef(l *lex.Lexer) lex.StateFn {
-	if err := lex.LexIRIRef(l, itemName); err != nil {
+	if err := lex.IRIRef(l, itemName); err != nil {
 		return l.Errorf(err.Error())
-	}
-	return l.Mode
-}
-
-// lexFilterFuncName expects input to look like equal("...", "...").
-func lexFilterFuncName(l *lex.Lexer) lex.StateFn {
-	for {
-		// The caller already checked isNameBegin, and absorbed one rune.
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue
-		}
-		l.Backup()
-		l.Emit(itemName)
-		break
 	}
 	return l.Mode
 }
@@ -339,7 +318,7 @@ func lexFilterFuncName(l *lex.Lexer) lex.StateFn {
 func lexDirectiveOrLangList(l *lex.Lexer) lex.StateFn {
 	r := l.Next()
 	// Check first character.
-	if !isNameBegin(r) && r != period {
+	if !isNameBegin(r) && r != period && r != star {
 		return l.Errorf("Unrecognized character in lexDirective: %#U", r)
 	}
 	l.Backup()
@@ -361,16 +340,8 @@ func lexDirectiveOrLangList(l *lex.Lexer) lex.StateFn {
 }
 
 func lexName(l *lex.Lexer) lex.StateFn {
-	for {
-		// The caller already checked isNameBegin, and absorbed one rune.
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue
-		}
-		l.Backup()
-		l.Emit(itemName)
-		break
-	}
+	l.AcceptRun(isNameSuffix)
+	l.Emit(itemName)
 	return l.Mode
 }
 
@@ -378,7 +349,7 @@ func lexName(l *lex.Lexer) lex.StateFn {
 func lexComment(l *lex.Lexer) lex.StateFn {
 	for {
 		r := l.Next()
-		if isEndOfLine(r) {
+		if lex.IsEndOfLine(r) {
 			l.Ignore()
 			return l.Mode
 		}
@@ -467,45 +438,32 @@ LOOP:
 
 // lexOperationType lexes a query or mutation or schema operation type.
 func lexOperationType(l *lex.Lexer) lex.StateFn {
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		// l.Pos would be index of the end of operation type + 1.
-		word := l.Input[l.Start:l.Pos]
-		if word == "mutation" {
-			l.Emit(itemOpType)
-			return lexInsideMutation
-		} else if word == "fragment" {
-			l.Emit(itemOpType)
-			return lexQuery
-		} else if word == "query" {
-			l.Emit(itemOpType)
-			return lexQuery
-		} else if word == "schema" {
-			l.Emit(itemOpType)
-			return lexInsideSchema
-		} else {
-			l.Errorf("Invalid operation type: %s", word)
-		}
-		break
+	l.AcceptRun(isNameSuffix)
+	// l.Pos would be index of the end of operation type + 1.
+	word := l.Input[l.Start:l.Pos]
+	if word == "mutation" {
+		l.Emit(itemOpType)
+		return lexInsideMutation
+	} else if word == "fragment" {
+		l.Emit(itemOpType)
+		return lexQuery
+	} else if word == "query" {
+		l.Emit(itemOpType)
+		return lexQuery
+	} else if word == "schema" {
+		l.Emit(itemOpType)
+		return lexInsideSchema
+	} else {
+		l.Errorf("Invalid operation type: %s", word)
 	}
+
 	return lexQuery
 }
 
 // lexArgName lexes and emits the name part of an argument.
 func lexArgName(l *lex.Lexer) lex.StateFn {
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue
-		}
-		l.Backup()
-		l.Emit(itemName)
-		break
-	}
+	l.AcceptRun(isNameSuffix)
+	l.Emit(itemName)
 	return l.Mode
 }
 
@@ -517,11 +475,6 @@ func isDollar(r rune) bool {
 // isSpace returns true if the rune is a tab or space.
 func isSpace(r rune) bool {
 	return r == '\u0009' || r == '\u0020'
-}
-
-// isEndOfLine returns true if the rune is a Linefeed or a Carriage return.
-func isEndOfLine(r rune) bool {
-	return r == '\u000A' || r == '\u000D'
 }
 
 // isEndLiteral returns true if rune is quotation mark.
@@ -542,6 +495,9 @@ func isLangOrDirective(r rune) bool {
 		return true
 	}
 	if r >= '0' && r <= '9' {
+		return true
+	}
+	if r == '*' {
 		return true
 	}
 	return false

@@ -1,53 +1,50 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2015-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package posting
 
 import (
-	"bytes"
-	"crypto/md5"
+	"context"
 	"fmt"
 	"io/ioutil"
-	"math"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/trace"
+	ostats "go.opencensus.io/stats"
 
 	"github.com/dgraph-io/badger"
 	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/dgo/protos/api"
+	"github.com/golang/glog"
 
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 )
 
 var (
-	dummyPostingList []byte // Used for indexing.
-	elog             trace.EventLog
+	emptyPostingList []byte // Used for indexing.
 )
 
 const (
-	MB = 1 << 20
+	mb = 1 << 20
 )
 
 // syncMarks stores the watermark for synced RAFT proposals. Each RAFT proposal consists
@@ -64,15 +61,11 @@ const (
 // RAFT entries discarded.
 func init() {
 	x.AddInit(func() {
-		h := md5.New()
-		pl := intern.PostingList{
-			Checksum: h.Sum(nil),
-		}
+		pl := pb.PostingList{}
 		var err error
-		dummyPostingList, err = pl.Marshal()
+		emptyPostingList, err = pl.Marshal()
 		x.Check(err)
 	})
-	elog = trace.NewEventLog("Memory", "")
 }
 
 func getMemUsage() int {
@@ -100,7 +93,7 @@ func getMemUsage() int {
 
 	contents, err := ioutil.ReadFile("/proc/self/stat")
 	if err != nil {
-		x.Println("Can't read the proc file", err)
+		glog.Errorf("Can't read the proc file. Err: %v\n", err)
 		return 0
 	}
 
@@ -108,82 +101,24 @@ func getMemUsage() int {
 	// 24th entry of the file is the RSS which denotes the number of pages
 	// used by the process.
 	if len(cont) < 24 {
-		x.Println("Error in RSS from stat")
+		glog.Errorln("Error in RSS from stat")
 		return 0
 	}
 
 	rss, err := strconv.Atoi(cont[23])
 	if err != nil {
-		x.Println(err)
+		glog.Errorln(err)
 		return 0
 	}
 
 	return rss * os.Getpagesize()
 }
 
-func periodicUpdateStats(lc *y.Closer) {
-	defer lc.Done()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	setLruMemory := true
-	var maxSize uint64
-	var lastUse float64
-	for {
-		select {
-		case <-lc.HasBeenClosed():
-			return
-		case <-ticker.C:
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
-			megs := (ms.HeapInuse + ms.StackInuse) / (1 << 20)
-			inUse := float64(megs)
-
-			stats := lcache.Stats()
-			x.EvictedPls.Set(int64(stats.NumEvicts))
-			x.LcacheSize.Set(int64(stats.Size))
-			x.LcacheLen.Set(int64(stats.Length))
-
-			// Okay, we exceed the max memory threshold.
-			// Stop the world, and deal with this first.
-			x.NumGoRoutines.Set(int64(runtime.NumGoroutine()))
-			Config.Mu.Lock()
-			mem := Config.AllottedMemory
-			Config.Mu.Unlock()
-			if setLruMemory {
-				if inUse > 0.75*mem {
-					maxSize = lcache.UpdateMaxSize(0)
-					setLruMemory = false
-					lastUse = inUse
-				}
-				break
-			}
-
-			// If memory has not changed by 100MB.
-			if math.Abs(inUse-lastUse) < 100 {
-				break
-			}
-
-			delta := maxSize / 10
-			if delta > 50<<20 {
-				delta = 50 << 20 // Change lru cache size by max 50mb.
-			}
-			if inUse > 0.85*mem { // Decrease max Size by 10%
-				maxSize -= delta
-				maxSize = lcache.UpdateMaxSize(maxSize)
-				lastUse = inUse
-			} else if inUse < 0.65*mem { // Increase max Size by 10%
-				maxSize += delta
-				maxSize = lcache.UpdateMaxSize(maxSize)
-				lastUse = inUse
-			}
-		}
-	}
-}
-
 func updateMemoryMetrics(lc *y.Closer) {
 	defer lc.Done()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-lc.HasBeenClosed():
@@ -191,176 +126,161 @@ func updateMemoryMetrics(lc *y.Closer) {
 		case <-ticker.C:
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
-			megs := (ms.HeapInuse + ms.StackInuse)
 
-			inUse := float64(megs)
-			idle := float64(ms.HeapIdle - ms.HeapReleased)
+			inUse := ms.HeapInuse + ms.StackInuse
+			// From runtime/mstats.go:
+			// HeapIdle minus HeapReleased estimates the amount of memory
+			// that could be returned to the OS, but is being retained by
+			// the runtime so it can grow the heap without requesting more
+			// memory from the OS. If this difference is significantly
+			// larger than the heap size, it indicates there was a recent
+			// transient spike in live heap size.
+			idle := ms.HeapIdle - ms.HeapReleased
 
-			x.MemoryInUse.Set(int64(inUse))
-			x.HeapIdle.Set(int64(idle))
-			x.TotalOSMemory.Set(int64(getMemUsage()))
+			ostats.Record(context.Background(),
+				x.MemoryInUse.M(int64(inUse)),
+				x.MemoryIdle.M(int64(idle)),
+				x.MemoryProc.M(int64(getMemUsage())))
 		}
 	}
 }
 
 var (
-	pstore *badger.ManagedDB
-	lcache *listCache
-	btree  *BTree
+	pstore *badger.DB
 	closer *y.Closer
 )
 
 // Init initializes the posting lists package, the in memory and dirty list hash.
-func Init(ps *badger.ManagedDB) {
+func Init(ps *badger.DB) {
 	pstore = ps
-	lcache = newListCache(math.MaxUint64)
-	btree = newBTree(2)
-	x.LcacheCapacity.Set(math.MaxInt64)
-
-	closer = y.NewCloser(3)
-
-	go periodicUpdateStats(closer)
+	closer = y.NewCloser(1)
 	go updateMemoryMetrics(closer)
-	go periodicPurgeOldVersions(closer)
 }
 
+// Cleanup waits until the closer has finished processing.
 func Cleanup() {
 	closer.SignalAndWait()
-}
-
-func StopLRUEviction() {
-	atomic.StoreInt32(&lcache.done, 1)
-}
-
-func periodicPurgeOldVersions(lc *y.Closer) {
-	defer lc.Done()
-
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	// Runs every 1 minute
-	purge := func() {
-		opt := badger.DefaultIteratorOptions
-		opt.PrefetchValues = false
-		opt.AllVersions = true
-
-		txn := pstore.NewTransactionAt(math.MaxUint64, false)
-		defer txn.Discard()
-		itr := txn.NewIterator(opt)
-		defer itr.Close()
-
-		var prevKey []byte
-		// Iterate  over all versions of key, from latest to oldest
-		// For each key find the latest complete pl and purge all versions
-		// below that
-		for itr.Rewind(); itr.Valid(); itr.Next() {
-			item := itr.Item()
-			key := item.Key()
-			if bytes.Equal(key, prevKey) {
-				continue
-			}
-			if item.UserMeta()&BitCompletePosting == 0 {
-				continue
-			}
-			// Found complete pl, purge all versions below this TS
-			pstore.PurgeVersionsBelow(key, item.Version())
-			if cap(prevKey) < len(key) {
-				prevKey = make([]byte, len(key))
-			}
-			prevKey = prevKey[:len(key)]
-			copy(prevKey, key)
-		}
-	}
-	for {
-		select {
-		case <-lc.HasBeenClosed():
-			return
-		case <-ticker.C:
-			purge()
-		}
-	}
 }
 
 // Get stores the List corresponding to key, if it's not there already.
 // to lru cache and returns it.
 //
 // plist := Get(key, group)
-// ... // Use plist
+// ... Use plist
 // TODO: This should take a node id and index. And just append all indices to a list.
 // When doing a commit, it should update all the sync index watermarks.
 // worker pkg would push the indices to the watermarks held by lists.
 // And watermark stuff would have to be located outside worker pkg, maybe in x.
 // That way, we don't have a dependency conflict.
-func Get(key []byte) (rlist *List) {
-	lp := lcache.Get(string(key))
-	if lp != nil {
-		x.CacheHit.Add(1)
-		return lp
-	}
-	x.CacheMiss.Add(1)
-
-	// Any initialization for l must be done before PutIfMissing. Once it's added
-	// to the map, any other goroutine can retrieve it.
-	l, _ := getNew(key, pstore)
-	// We are always going to return lp to caller, whether it is l or not
-	lp = lcache.PutIfMissing(string(key), l)
-	if lp != l {
-		x.CacheRace.Add(1)
-	} else if atomic.LoadInt32(&l.onDisk) == 0 {
-		btree.Insert(l.key)
-	}
-	return lp
+func GetNoStore(key []byte) (rlist *List, err error) {
+	return getNew(key, pstore)
 }
 
-// GetLru checks the lru map and returns it if it exits
-func GetLru(key []byte) *List {
-	return lcache.Get(string(key))
+// LocalCache stores a cache of posting lists and deltas.
+// This doesn't sync, so call this only when you don't care about dirty posting lists in
+// memory(for example before populating snapshot) or after calling syncAllMarks
+type LocalCache struct {
+	sync.RWMutex
+
+	startTs uint64
+
+	// The keys for these maps is a string representation of the Badger key for the posting list.
+	// deltas keep track of the updates made by txn. These must be kept around until written to disk
+	// during commit.
+	deltas map[string][]byte
+
+	// max committed timestamp of the read posting lists.
+	maxVersions map[string]uint64
+
+	// plists are posting lists in memory. They can be discarded to reclaim space.
+	plists map[string]*List
 }
 
-// GetNoStore takes a key. It checks if the in-memory map has an updated value and returns it if it exists
-// or it gets from the store and DOES NOT ADD to lru cache.
-func GetNoStore(key []byte) (rlist *List) {
-	lp := lcache.Get(string(key))
-	if lp != nil {
-		return lp
+// NewLocalCache returns a new LocalCache instance.
+func NewLocalCache(startTs uint64) *LocalCache {
+	return &LocalCache{
+		startTs:     startTs,
+		deltas:      make(map[string][]byte),
+		plists:      make(map[string]*List),
+		maxVersions: make(map[string]uint64),
 	}
-	lp, _ = getNew(key, pstore) // This retrieves a new *List and sets refcount to 1.
-	return lp
 }
 
-// This doesn't sync, so call this only when you don't care about dirty posting lists in // memory(for example before populating snapshot) or after calling syncAllMarks
-func EvictLRU() {
-	lcache.Reset()
+func (lc *LocalCache) getNoStore(key string) *List {
+	lc.RLock()
+	defer lc.RUnlock()
+	if l, ok := lc.plists[key]; ok {
+		return l
+	}
+	return nil
 }
 
-func CommitLists(commit func(key []byte) bool) {
-	// We iterate over lru and pushing values (List) into this
-	// channel. Then goroutines right below will commit these lists to data store.
-	workChan := make(chan *List, 10000)
+// TODO(martinmr): add documentation.
+func (lc *LocalCache) Set(key string, updated *List) *List {
+	lc.Lock()
+	defer lc.Unlock()
+	if pl, ok := lc.plists[key]; ok {
+		return pl
+	}
+	lc.plists[key] = updated
+	return updated
+}
 
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for l := range workChan {
-				l.SyncIfDirty(false)
-			}
-		}()
+// Get retrieves the cached version of the list associated with the given key.
+func (lc *LocalCache) Get(key []byte) (*List, error) {
+	if lc == nil {
+		return getNew(key, pstore)
+	}
+	skey := string(key)
+	if pl := lc.getNoStore(skey); pl != nil {
+		return pl, nil
 	}
 
-	lcache.iterate(func(l *List) bool {
-		if commit(l.key) {
-			workChan <- l
+	pl, err := getNew(key, pstore)
+	if err != nil {
+		return nil, err
+	}
+	// If we just brought this posting list into memory and we already have a delta for it, let's
+	// apply it before returning the list.
+	lc.RLock()
+	if delta, ok := lc.deltas[skey]; ok && len(delta) > 0 {
+		pl.setMutation(lc.startTs, delta)
+	}
+	lc.RUnlock()
+	return lc.Set(skey, pl), nil
+}
+
+// UpdateDeltasAndDiscardLists updates the delta cache before removing the stored posting lists.
+func (lc *LocalCache) UpdateDeltasAndDiscardLists() {
+	lc.Lock()
+	defer lc.Unlock()
+	if len(lc.plists) == 0 {
+		return
+	}
+
+	for key, pl := range lc.plists {
+		data := pl.getMutation(lc.startTs)
+		if len(data) > 0 {
+			lc.deltas[key] = data
 		}
-		return true
-	})
-	close(workChan)
-	wg.Wait()
+		lc.maxVersions[key] = pl.maxVersion()
+	}
+	lc.plists = make(map[string]*List)
+}
 
-	// Consider using sync in syncIfDirty instead of async.
-	// Hacky solution for now, ensures that everything is flushed to disk before we return.
-	txn := pstore.NewTransactionAt(1, true)
-	defer txn.Discard()
-	txn.Delete([]byte("_dummy_"))
-	txn.CommitAt(1, nil)
+func (lc *LocalCache) fillPreds(ctx *api.TxnContext, gid uint32) {
+	lc.RLock()
+	defer lc.RUnlock()
+	for key := range lc.deltas {
+		pk := x.Parse([]byte(key))
+		if len(pk.Attr) == 0 {
+			continue
+		}
+		// Also send the group id that the predicate was being served by. This is useful when
+		// checking if Zero should allow a commit during a predicate move.
+		predKey := fmt.Sprintf("%d-%s", gid, pk.Attr)
+		if !x.HasString(ctx.Preds, predKey) {
+			ctx.Preds = append(ctx.Preds, predKey)
+		}
+	}
 }

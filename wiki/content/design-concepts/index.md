@@ -20,22 +20,57 @@ transaction altogether despite it having been considered committed.
 Therefore, pre-writes do have to make it to disk. And if so, better to propose
 them in a Raft group.
 
+## Consistency Models
+[Last updated: Mar 2018]
+Basing it [on this
+article](https://aphyr.com/posts/313-strong-consistency-models) by aphyr.
+
+- **Sequential Consistency:** Different users would see updates at different times, but each user would see operations in order.
+
+Dgraph has a client-side sequencing mode, which provides sequential consistency.
+
+Here, let’s replace a “user” with a “client” (or a single process). In Dgraph, each client maintains a linearizable read map (linread map). Dgraph's data set is sharded into many "groups". Each group is a Raft group, where every write is done via a "proposal." You can think of a transaction in Dgraph, to consist of many group proposals.
+
+The leader in Raft group always has the most recent proposal, while
+replicas could be behind the leader in varying degrees. You can determine this
+by just looking at the latest applied proposal ID. A leader's proposal ID would
+be greater than or equal to some replicas' applied proposal ID.
+
+`linread` map stores a group -> max proposal ID seen, per client. If a client's
+last read had seen updates corresponding to proposal ID X, then `linread` map
+would store X for that group. The client would then use the `linread` map to
+inform future reads to ensure that the server servicing the request, has
+proposals >= X applied before servicing the read. Thus, all future reads,
+irrespective of which replica it might hit, would see updates for proposals >=
+X. Also, the `linread` map is updated continuously with max seen proposal IDs
+across all groups as reads and writes are done across transactions (within that
+client).
+
+In short, this map ensures that updates made by the client, or seen by the
+client, would never be *unseen*; in fact, they would be visible in a sequential
+order. There might be jumps though, for e.g., if a value X → Y → Z, the client
+might see X, then Z (and not see Y at all).
+
+- **Linearizability:** Each op takes effect atomically at some point between invocation and completion. Once op is complete, it would be visible to all.
+
+Dgraph supports server-side sequencing of updates, which provides
+linearizability. Unlike sequential consistency which provides sequencing per
+client, this provide sequencing across all clients. This is necessary to make
+upserts work across clients. Thus, once a transaction is committed, it would be
+visible to all future readers, irrespective of client boundaries.
+
+- **Causal consistency:** Dgraph does not have a concept of dependencies among transactions. So, does NOT order based on dependencies.
+- **Serializable consistency:** Dgraph does NOT allow arbitrary reordering of transactions, but does provide a linear order per key.
+
 ---
 
 {{% notice "outdated" %}}Sections below this one are outdated. You will find [Tour of Dgraph](https://tour.dgraph.io) a much helpful resource.{{% /notice %}}
 
 ## Concepts
 
-### XID <-> UID
-All the entities get assigned a unique 64 bit integer id, `UID`. If the entity has an external id `XID`,
-we fingerprint the `XID` and store the corresponding `UID`. If the entity does not have an `XID`,
-we only add a new `UID` to indicate that the `UID` is used. All the posting lists refer to entities
-via their UIDs. Given UIDs are 8 byte integers, this provides for a very efficient data representation.
-During data import, we require that each unique entity has a unique `UID`.
-
 ### Edges
 
-Typical data format is RDF [NQuad](https://www.w3.org/TR/n-quads/) which is:
+Typical data format is RDF [N-Quad](https://www.w3.org/TR/n-quads/) which is:
 
 * `Subject, Predicate, Object, Label`, aka
 * `Entity, Attribute, Other Entity / Value, Label`
@@ -44,10 +79,10 @@ Both the terminologies get used interchangeably in our code. Dgraph considers ed
 i.e. from `Subject -> Object`. This is the direction that the queries would be run.
 
 {{% notice "tip" %}}Dgraph can automatically generate a reverse edge. If the user wants to run
-queries in that direction, they would need to define the [reverse edge]({{< relref "query-language/index.md#reverse-edges" >}})
+queries in that direction, they would need to define the [reverse edge](/query-language#reverse-edges)
 as part of the schema.{{% /notice %}}
 
-Internally, the RDF NQuad gets parsed into this format.
+Internally, the RDF N-Quad gets parsed into this format.
 
 ```
 type DirectedEdge struct {
@@ -63,8 +98,7 @@ type DirectedEdge struct {
 }
 ```
 
-Note that irrespective of the input, both `Entity` and `Object/ValueId` get converted in `UID` format
-as explained in [XID <-> UID]({{< relref "#xid-uid" >}}).
+Note that irrespective of the input, both `Entity` and `Object/ValueId` get converted in `UID` format.
 
 ### Posting List
 Conceptually, a posting list contains all the `DirectedEdges` corresponding to an `Attribute`, in the
@@ -156,14 +190,18 @@ Posting Lists get stored in Badger, in a key-value format, like so:
 ```
 
 ### Group
-A set of Posting Lists sharing the same `Predicate` constitute a group. Each server can serve
-multiple distinct [groups]({{< relref "deploy/index.md#data-sharding" >}}).
 
-A group config file is used to determine which server would serve what groups. In the future
-versions, live Dgraph server would be able to move tablets around depending upon heuristics.
+Every Alpha server belongs to a particular group, and each group is responsible for serving a
+particular set of predicates. Multiple servers in a single group replicate the same data to achieve
+high availability and redundancy of data.
 
-If a groups gets too big, it could be split further. In this case, a single `Predicate` essentially
-gets divided across two groups.
+Predicates are automatically assigned to each group based on which group first receives the
+predicate. By default periodically predicates can be moved around to different groups upon
+heuristics to evenly distribute the data across the cluster. Predicates can also be moved manually
+if desired.
+
+In a future version, if a group gets too big, it could be split further. In this case, a single
+`Predicate` essentially gets divided across two groups.
 
 ```
   Original Group:
@@ -182,7 +220,7 @@ Each group should typically be served by atleast 3 servers, if available. In the
 failure, other servers serving the same group can still handle the load in that case.
 
 ### New Server and Discovery
-Dgraph cluster can detect new machines allocated to the [cluster]({{< relref "deploy/index.md#cluster" >}}),
+Dgraph cluster can detect new machines allocated to the [cluster](/deploy#cluster),
 establish connections, and transfer a subset of existing predicates to it based on the groups served
 by the new machine.
 
@@ -194,6 +232,11 @@ expensive. Instead, every mutation gets logged and synced to disk via append onl
 from a system crash, by replaying all the mutations since the last write to `Posting List`.
 
 ### Mutations
+
+{{% notice "outdated" %}}
+This section needs to be improved.
+{{% /notice %}}
+
 In addition to being written to `Write Ahead Logs`, a mutation also gets stored in memory as an
 overlay over immutable `Posting list` in a mutation layer. This mutation layer allows us to iterate
 over `Posting`s as though they're sorted, without requiring re-creating the posting list.
@@ -208,92 +251,48 @@ Every time we regenerate a posting list, we also write the max commit log timest
 included -- this helps us figure out how long back to seek in write-ahead logs when initializing
 the posting list, the first time it's brought back into memory.
 
-### Note on Transactions
-Dgraph does not support transactions at this point. A mutation can be composed of multiple
-[Edges]({{< relref "#edges">}}), each edge might belong to a different
-[Posting List]({{< relref "#posting-list" >}}). Dgraph acquires `RWMutex` locks at a posting list
-level. It DOES NOT acquire locks across multiple posting lists.
-
-What this means for writes is that some edges would get written before others, and so any reads
-which happen while a mutation is going on would read partially committed data. However, there's a
-guarantee of [**durability**](https://en.wikipedia.org/wiki/ACID#Durability). When a mutation
-succeeds, any successive reads will read the updated data in its entirety.
-
-On the other hand, if a mutation fails, it's up to the application author to clean the partially
-written data or retry with the right logic. The response from Dgraph would make it clear which edges
-weren't written so that the application author can set the right edges for retry.
-
-**Ways around this limitation**
-
-* You should determine if your reads need to have transactional [atomicity](https://en.wikipedia.org/wiki/ACID#Atomicity).
-Unless you are dealing with financial data, this might not be the case.
-* To ensure atomicity, you could have only one edge (RDF NQuads) per mutation. This would mean more
-network calls back and forth between client and server which would affect your write throughput, but
-would help make the failure handling logic easier.
-
-### Versioning
-Broadly speaking, there're two kinds of data stored in Dgraph. One is relationship data; other is value data.
-```
- Me friend person0    [Relation]
- Me name "Константи́н" [Value]
-```
-
-The way Dgraph stores [Posting List]({{< relref "#posting-list" >}}), the relationship data gets
-converted to UIDs and stored in a sorted list of increasing uint64 ids to allow for efficient
-traversal, lookups, and intersection.
-
-Versioning involves writing deltas and reading them to generate the final state. This isn't as
-effective when you're dealing with millions of UIDs and want to do the operations mentioned above.
-It would be too slow and memory-consuming to re-generate the long posting lists for every read operation.
-
-For those reasons, **versioning wouldn't be supported for relationship data.**
-
-On the other hand, we only expect one value per `subject-predicate-language` composite. This allows
-us to store many versions of this value in the same posting list, without having to do any
-regeneration. So, we can potentially support versioning of value data.
-
-{{% notice "warning" %}}Value data versioning is under consideration, and not yet implemented.{{% /notice %}}
-
 ### Queries
 
 Let's understand how query execution works, by looking at an example.
 
 ```
-me(id: m.abcde) {
-  pred_A
-  pred_B {
-    pred_B1
-    pred_B2
-  }
-  pred_C {
-    pred_C1
-    pred_C2 {
-      pred_C21
-   }
+{
+    me(func: uid(0x1)) {
+      pred_A
+      pred_B {
+        pred_B1
+        pred_B2
+      }
+      pred_C {
+        pred_C1
+        pred_C2 {
+          pred_C21
+      }
+      }
   }
 }
+
 ```
 
-Let's assume we have 3 server instances, and instance id = 2 receives this query. These are the steps:
+Let's assume we have 3 Alpha instances, and instance id=2 receives this query. These are the steps:
 
-* Determine the UID of provided XID, in this case `m.abcde` using fingerprinting. Say the UID = u.
-* Send queries to look up keys = `pred_A, u`, `pred_B, u`, and `pred_C, u`. These predicates could
-belong to 3 different groups, served by potentially different servers. So, this would typically
+* Send queries to look up keys = `pred_A, 0x1`, `pred_B, 0x1`, and `pred_C, 0x1`. These predicates could
+belong to 3 different groups, served by potentially different Alpha servers. So, this would typically
 incur at max 3 network calls (equal to number of predicates at this step).
-* The above queries would return back 3 list of ids or value. The result of `pred_B` and `pred_C`
+* The above queries would return back 3 lists of UIDs or values. The result of `pred_B` and `pred_C`
 would be converted into queries for `pred_Bi` and `pred_Ci`.
 * `pred_Bi` and `pred_Ci` would then cause at max 4 network calls, depending upon where these
-predicates are located. The keys for `pred_Bi` for e.g. would be `pred_Bi, res_pred_Bk`, where
-res_pred_Bk = list of resulting ids from `pred_B, u`.
+predicates are located. The keys for `pred_Bi`, for example, would be `pred_Bi, res_pred_Bk`, where
+res_pred_Bk = list of resulting UIDs from `pred_B, u`.
 * Looking at `res_pred_C2`, you'll notice that this would be a list of lists aka list matrix. We
 merge these list of lists into a sorted list with distinct elements to form the query for `pred_C21`.
 * Another network call depending upon where `pred_C21` lies, and this would again give us a list of
-list ids / value.
+list UIDs / value.
 
 If the query was run via HTTP interface `/query`, this subgraph gets converted into JSON for
 replying back to the client. If the query was run via [gRPC](https://www.grpc.io/) interface using
 the language [clients]({{< relref "clients/index.md" >}}), the subgraph gets converted to
-[protocol buffer](https://developers.google.com/protocol-buffers/) format, and returned to client.
+[protocol buffer](https://developers.google.com/protocol-buffers/) format and then returned to client.
 
 ### Network Calls
 Compared to RAM or SSD access, network calls are slow.

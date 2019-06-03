@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package query
@@ -22,17 +21,16 @@ import (
 	"fmt"
 	"math"
 
-	"golang.org/x/net/trace"
-
 	"github.com/dgraph-io/dgraph/algo"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error {
 	// Note: Key format is - "attr|fromUID|toUID"
 	reachMap := make(map[string]struct{})
 	allowLoop := start.Params.RecurseArgs.AllowLoop
-	var numEdges int
+	var numEdges uint64
 	var exec []*SubGraph
 	var err error
 
@@ -47,32 +45,19 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 	select {
 	case err = <-rrch:
 		if err != nil {
-			if tr, ok := trace.FromContext(ctx); ok {
-				tr.LazyPrintf("Error while processing child task: %+v", err)
-			}
 			return err
 		}
 	case <-ctx.Done():
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Context done before full execution: %+v", ctx.Err())
-		}
 		return ctx.Err()
 	}
 
-	// Add children back so that expandSubgraph can expand them if needed.
-	start.Children = append(start.Children, startChildren...)
-	if startChildren, err = expandSubgraph(ctx, start); err != nil {
-		return err
+	if start.UnknownAttr {
+		return nil
 	}
 
-	start.Children = start.Children[:0]
-	for _, child := range startChildren {
-		temp := new(SubGraph)
-		temp.copyFiltersRecurse(child)
-		temp.SrcUIDs = start.DestUIDs
-		temp.Params.Var = child.Params.Var
-		exec = append(exec, temp)
-		start.Children = append(start.Children, temp)
+	// Add children back and expand if necessary
+	if exec, err = expandChildren(ctx, start, startChildren); err != nil {
+		return err
 	}
 
 	dummy := &SubGraph{}
@@ -82,6 +67,16 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 			return nil
 		}
 		depth++
+
+		// When the maximum depth has been reached, avoid retrieving any facets as
+		// the nodes at the other end of the edge will not be a part of this query.
+		// Otherwise, the facets will be included in the query without any other
+		// information about the node, which is quite counter-intuitive.
+		if depth == maxDepth {
+			for _, sg := range exec {
+				sg.Params.Facet = nil
+			}
+		}
 
 		rrch := make(chan error, len(exec))
 		for _, sg := range exec {
@@ -93,17 +88,11 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 			select {
 			case err = <-rrch:
 				if err != nil {
-					if tr, ok := trace.FromContext(ctx); ok {
-						tr.LazyPrintf("Error while processing child task: %+v", err)
-					}
 					if recurseErr == nil {
 						recurseErr = err
 					}
 				}
 			case <-ctx.Done():
-				if tr, ok := trace.FromContext(ctx); ok {
-					tr.LazyPrintf("Context done before full execution: %+v", ctx.Err())
-				}
 				if recurseErr == nil {
 					recurseErr = ctx.Err()
 				}
@@ -115,6 +104,15 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 		}
 
 		for _, sg := range exec {
+			// sg.uidMatrix can be empty. Continue if that is the case.
+			if len(sg.uidMatrix) == 0 {
+				continue
+			}
+
+			if sg.UnknownAttr {
+				continue
+			}
+
 			if len(sg.Filters) > 0 {
 				// We need to do this in case we had some filters.
 				sg.updateUidMatrix()
@@ -123,7 +121,7 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 			for mIdx, fromUID := range sg.SrcUIDs.Uids {
 				if allowLoop {
 					for _, ul := range sg.uidMatrix {
-						numEdges = numEdges + len(ul.Uids)
+						numEdges += uint64(len(ul.Uids))
 					}
 				} else {
 					algo.ApplyFilter(sg.uidMatrix[mIdx], func(uid uint64, i int) bool {
@@ -131,12 +129,11 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 						_, seen := reachMap[key] // Combine fromUID here.
 						if seen {
 							return false
-						} else {
-							// Mark this edge as taken. We'd disallow this edge later.
-							reachMap[key] = struct{}{}
-							numEdges++
-							return true
 						}
+						// Mark this edge as taken. We'd disallow this edge later.
+						reachMap[key] = struct{}{}
+						numEdges++
+						return true
 					})
 				}
 			}
@@ -150,23 +147,24 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 
 		// modify the exec and attach child nodes.
 		var out []*SubGraph
+		var exp []*SubGraph
 		for _, sg := range exec {
+			if sg.UnknownAttr == true {
+				continue
+			}
 			if len(sg.DestUIDs.Uids) == 0 {
 				continue
 			}
-			for _, child := range startChildren {
-				temp := new(SubGraph)
-				temp.copyFiltersRecurse(child)
-				temp.SrcUIDs = sg.DestUIDs
-				temp.Params.Var = child.Params.Var
-				sg.Children = append(sg.Children, temp)
-				out = append(out, temp)
+			if exp, err = expandChildren(ctx, sg, startChildren); err != nil {
+				return err
 			}
+			out = append(out, exp...)
 		}
 
-		if numEdges > 1000000 {
-			// If we've seen too many nodes, stop the query.
-			return ErrTooBig
+		if numEdges > x.Config.QueryEdgeLimit {
+			// If we've seen too many edges, stop the query.
+			return errors.Errorf("Exceeded query edge limit = %v. Found %v edges.",
+				x.Config.QueryEdgeLimit, numEdges)
 		}
 
 		if len(out) == 0 {
@@ -176,19 +174,52 @@ func (start *SubGraph) expandRecurse(ctx context.Context, maxDepth uint64) error
 	}
 }
 
-func Recurse(ctx context.Context, sg *SubGraph) error {
+// expandChildren adds child nodes to a SubGraph with no children, expanding them if necessary.
+func expandChildren(ctx context.Context, sg *SubGraph, children []*SubGraph) ([]*SubGraph, error) {
+	if len(sg.Children) > 0 {
+		return nil, errors.New("Subgraph should not have any children")
+	}
+	// Add children and expand if necessary
+	sg.Children = append(sg.Children, children...)
+	expandedChildren, err := expandSubgraph(ctx, sg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*SubGraph, 0, len(expandedChildren))
+	sg.Children = sg.Children[:0]
+	// Link new child nodes back to parent destination UIDs
+	for _, child := range expandedChildren {
+		newChild := new(SubGraph)
+		newChild.copyFiltersRecurse(child)
+		newChild.SrcUIDs = sg.DestUIDs
+		newChild.Params.Var = child.Params.Var
+		sg.Children = append(sg.Children, newChild)
+		out = append(out, newChild)
+	}
+	return out, nil
+}
+
+func recurse(ctx context.Context, sg *SubGraph) error {
 	if !sg.Params.Recurse {
-		return x.Errorf("Invalid recurse path query")
+		return errors.Errorf("Invalid recurse path query")
 	}
 
 	depth := sg.Params.RecurseArgs.Depth
 	if depth == 0 {
 		if sg.Params.RecurseArgs.AllowLoop {
-			return x.Errorf("depth must be > 0 when loop is true for recurse query.")
+			return errors.Errorf("Depth must be > 0 when loop is true for recurse query")
 		}
 		// If no depth is specified, expand till we reach all leaf nodes
 		// or we see reach too many nodes.
 		depth = math.MaxUint64
 	}
+
+	for _, child := range sg.Children {
+		if len(child.Children) > 0 {
+			return errors.Errorf(
+				"recurse queries require that all predicates are specified in one level")
+		}
+	}
+
 	return sg.expandRecurse(ctx, depth)
 }

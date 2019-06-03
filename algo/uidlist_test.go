@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package algo
@@ -23,24 +22,24 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/dgraph-io/dgraph/bp128"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/codec"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/stretchr/testify/require"
 )
 
-func newList(data []uint64) *intern.List {
-	return &intern.List{data}
+func newList(data []uint64) *pb.List {
+	return &pb.List{Uids: data}
 }
 
 func TestMergeSorted1(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{55}),
 	}
 	require.Equal(t, MergeSorted(input).Uids, []uint64{55})
 }
 
 func TestMergeSorted2(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 3, 6, 8, 10}),
 		newList([]uint64{2, 4, 5, 7, 15}),
 	}
@@ -49,7 +48,7 @@ func TestMergeSorted2(t *testing.T) {
 }
 
 func TestMergeSorted3(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 3, 6, 8, 10}),
 		newList([]uint64{}),
 	}
@@ -57,7 +56,7 @@ func TestMergeSorted3(t *testing.T) {
 }
 
 func TestMergeSorted4(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{}),
 		newList([]uint64{1, 3, 6, 8, 10}),
 	}
@@ -65,7 +64,7 @@ func TestMergeSorted4(t *testing.T) {
 }
 
 func TestMergeSorted5(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{}),
 		newList([]uint64{}),
 	}
@@ -73,7 +72,7 @@ func TestMergeSorted5(t *testing.T) {
 }
 
 func TestMergeSorted6(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{11, 13, 16, 18, 20}),
 		newList([]uint64{12, 14, 15, 15, 16, 16, 17, 25}),
 		newList([]uint64{1, 2}),
@@ -83,7 +82,7 @@ func TestMergeSorted6(t *testing.T) {
 }
 
 func TestMergeSorted7(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{5, 6, 7}),
 		newList([]uint64{3, 4}),
 		newList([]uint64{1, 2}),
@@ -93,19 +92,19 @@ func TestMergeSorted7(t *testing.T) {
 }
 
 func TestMergeSorted8(t *testing.T) {
-	input := []*intern.List{}
+	input := []*pb.List{}
 	require.Empty(t, MergeSorted(input).Uids)
 }
 
 func TestMergeSorted9(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 1, 1}),
 	}
 	require.Equal(t, MergeSorted(input).Uids, []uint64{1})
 }
 
 func TestMergeSorted10(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3, 3, 6}),
 		newList([]uint64{4, 8, 9}),
 	}
@@ -113,7 +112,7 @@ func TestMergeSorted10(t *testing.T) {
 }
 
 func TestIntersectSorted1(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{2, 3, 4, 5}),
 	}
@@ -121,26 +120,26 @@ func TestIntersectSorted1(t *testing.T) {
 }
 
 func TestIntersectSorted2(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 	}
 	require.Equal(t, IntersectSorted(input).Uids, []uint64{1, 2, 3})
 }
 
 func TestIntersectSorted3(t *testing.T) {
-	input := []*intern.List{}
+	input := []*pb.List{}
 	require.Empty(t, IntersectSorted(input).Uids)
 }
 
 func TestIntersectSorted4(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{100, 101}),
 	}
 	require.Equal(t, IntersectSorted(input).Uids, []uint64{100, 101})
 }
 
 func TestIntersectSorted5(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{2, 3, 4, 5}),
 		newList([]uint64{4, 5, 6}),
@@ -149,7 +148,7 @@ func TestIntersectSorted5(t *testing.T) {
 }
 
 func TestIntersectSorted6(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{10, 12, 13}),
 		newList([]uint64{2, 3, 4, 13}),
 		newList([]uint64{4, 5, 6}),
@@ -158,7 +157,7 @@ func TestIntersectSorted6(t *testing.T) {
 }
 
 func TestDiffSorted1(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{1}),
 	}
@@ -167,7 +166,7 @@ func TestDiffSorted1(t *testing.T) {
 }
 
 func TestDiffSorted2(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{2}),
 	}
@@ -176,7 +175,7 @@ func TestDiffSorted2(t *testing.T) {
 }
 
 func TestDiffSorted3(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{3}),
 	}
@@ -185,7 +184,7 @@ func TestDiffSorted3(t *testing.T) {
 }
 
 func TestDiffSorted4(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{}),
 	}
@@ -194,7 +193,7 @@ func TestDiffSorted4(t *testing.T) {
 }
 
 func TestDiffSorted5(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{}),
 		newList([]uint64{1, 2}),
 	}
@@ -203,7 +202,7 @@ func TestDiffSorted5(t *testing.T) {
 }
 
 func TestSubSorted1(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{1, 2, 3}),
 		newList([]uint64{2, 3, 4, 5}),
 	}
@@ -212,7 +211,7 @@ func TestSubSorted1(t *testing.T) {
 }
 
 func TestSubSorted6(t *testing.T) {
-	input := []*intern.List{
+	input := []*pb.List{
 		newList([]uint64{10, 12, 13}),
 		newList([]uint64{2, 3, 4, 13}),
 	}
@@ -300,9 +299,9 @@ func BenchmarkListIntersectRandom(b *testing.B) {
 
 		u := newList(u1)
 		v := newList(v1)
-		dst1 := &intern.List{}
-		dst2 := &intern.List{}
-		compressedUids := bp128.DeltaPack(u1)
+		dst1 := &pb.List{}
+		dst2 := &pb.List{}
+		compressedUids := codec.Encode(u1, 256)
 
 		b.Run(fmt.Sprintf(":size=%d:overlap=%.2f:", arrSz, overlap),
 			func(b *testing.B) {
@@ -342,12 +341,10 @@ func BenchmarkListIntersectRandom(b *testing.B) {
 
 func BenchmarkListIntersectRatio(b *testing.B) {
 	randomTests := func(sz int, overlap float64) {
-		sz1 := sz
-		sz2 := sz
 		rs := []int{1, 10, 50, 100, 500, 1000, 10000, 100000, 1000000}
 		for _, r := range rs {
-			sz1 = sz
-			sz2 = sz * r
+			sz1 := sz
+			sz2 := sz * r
 			if sz2 > 1000000 {
 				break
 			}
@@ -363,14 +360,14 @@ func BenchmarkListIntersectRatio(b *testing.B) {
 			sort.Slice(u1, func(i, j int) bool { return u1[i] < u1[j] })
 			sort.Slice(v1, func(i, j int) bool { return v1[i] < v1[j] })
 
-			u := &intern.List{u1}
-			v := &intern.List{v1}
-			dst1 := &intern.List{}
-			dst2 := &intern.List{}
-			compressedUids := bp128.DeltaPack(v1)
+			u := &pb.List{Uids: u1}
+			v := &pb.List{Uids: v1}
+			dst1 := &pb.List{}
+			dst2 := &pb.List{}
+			compressedUids := codec.Encode(v1, 256)
 
 			fmt.Printf("len: %d, compressed: %d, bytes/int: %f\n",
-				len(v1), len(compressedUids), float64(len(compressedUids))/float64(len(v1)))
+				len(v1), compressedUids.Size(), float64(compressedUids.Size())/float64(len(v1)))
 			b.Run(fmt.Sprintf(":IntersectWith:ratio=%d:size=%d:overlap=%.2f:", r, sz, overlap),
 				func(b *testing.B) {
 					for k := 0; k < b.N; k++ {
@@ -411,7 +408,7 @@ func BenchmarkListIntersectRatio(b *testing.B) {
 func skipDuplicate(in []uint64, idx int) int {
 	i := idx + 1
 	for i < len(in) && in[i] == in[idx] {
-		i += 1
+		i++
 	}
 	return i
 }

@@ -1,56 +1,63 @@
-# This file can be used to setup a Dgraph cluster with 6 Dgraph servers and 3 Zero nodes on a
-# Docker Swarm with replication. This setup ensures high availability for both Zero and Server.
+# This file can be used to setup a Dgraph cluster with 6 Dgraph Alphas and 3 Dgraph Zero nodes on a
+# Docker Swarm with replication. This setup ensures high availability for both Zero and Alpha.
 
 # It expects six virtual machines with hostnames host1, host2, host3, host4, host5 and host6 to
-# be part of the swarm.  There is a constraint to make sure that Dgraph servers run on a particular
-# host. Dgraph Zero nodes run on host1, host2 and host3.
+# be part of the swarm.  There is a constraint to make sure that each Dgraph Alpha runs on a
+# particular host. Dgraph Zero nodes run on host1, host2 and host3.
 
 # Data would be persisted to a docker volume called data-volume on the virtual machines which are
 # part of the swarm.
 # Run `docker stack deploy -c docker-compose-ha.yml` on the Swarm leader to start the cluster.
 
-version: "3"
+version: "3.2"
 networks:
   dgraph:
 services:
   zero_1:
-    image: dgraph/dgraph:test
+    image: dgraph/dgraph:latest
     volumes:
       - data-volume:/dgraph
     ports:
+      - 5080:5080
       - 6080:6080
     networks:
       - dgraph
     deploy:
       placement:
         constraints:
-          - node.hostname == host1
-    command: dgraph zero -o -2000 --my=zero_1:5080 --replicas 3 --idx 1
+          - node.hostname == aws01
+    command: dgraph zero --my=zero_1:5080 --replicas 3 --idx 1
   zero_2:
-    image: dgraph/dgraph:test
+    image: dgraph/dgraph:latest
     volumes:
       - data-volume:/dgraph
+    ports:
+      - 5081:5081
+      - 6081:6081
     networks:
       - dgraph
     deploy:
       placement:
         constraints:
-          - node.hostname == host2
-    command: dgraph zero -o -1999 --my=zero_2:5081 --replicas 3 --peer zero_1:5080 --idx 2
+          - node.hostname == aws02
+    command: dgraph zero -o 1 --my=zero_2:5081 --replicas 3 --peer zero_1:5080 --idx 2
   zero_3:
-    image: dgraph/dgraph:test
+    image: dgraph/dgraph:latest
     volumes:
       - data-volume:/dgraph
+    ports:
+      - 5082:5082
+      - 6082:6082
     networks:
       - dgraph
     deploy:
       placement:
         constraints:
-          - node.hostname == host3
-    command: dgraph zero -o -1998 --my=zero_3:5082 --replicas 3 --peer zero_1:5080 --idx 3
-  server_1:
-    image: dgraph/dgraph:test
-    hostname: "server_1"
+          - node.hostname == aws03
+    command: dgraph zero -o 2 --my=zero_3:5082 --replicas 3 --peer zero_1:5080 --idx 3
+  alpha_1:
+    image: dgraph/dgraph:latest
+    hostname: "alpha_1"
     volumes:
       - data-volume:/dgraph
     ports:
@@ -62,11 +69,11 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.hostname == host1
-    command: dgraph server --my=server_1:7080 --memory_mb=2048 --zero=zero_1:5080
-  server_2:
-    image: dgraph/dgraph:test
-    hostname: "server_2"
+          - node.hostname == aws01
+    command: dgraph alpha --my=alpha_1:7080 --lru_mb=2048 --zero=zero_1:5080
+  alpha_2:
+    image: dgraph/dgraph:latest
+    hostname: "alpha_2"
     volumes:
       - data-volume:/dgraph
     ports:
@@ -78,11 +85,11 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.hostname == host2
-    command: dgraph server --my=server_2:7081 --memory_mb=2048 --zero=zero_1:5080 -o 1
-  server_3:
-    image: dgraph/dgraph:test
-    hostname: "server_3"
+          - node.hostname == aws02
+    command: dgraph alpha --my=alpha_2:7081 --lru_mb=2048 --zero=zero_1:5080 -o 1
+  alpha_3:
+    image: dgraph/dgraph:latest
+    hostname: "alpha_3"
     volumes:
       - data-volume:/dgraph
     ports:
@@ -94,11 +101,11 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.hostname == host3
-    command: dgraph server --my=server_3:7082 --memory_mb=2048 --zero=zero_1:5080 -o 2
-  server_4:
-    image: dgraph/dgraph:test
-    hostname: "server_4"
+          - node.hostname == aws03
+    command: dgraph alpha --my=alpha_3:7082 --lru_mb=2048 --zero=zero_1:5080 -o 2
+  alpha_4:
+    image: dgraph/dgraph:latest
+    hostname: "alpha_4"
     volumes:
       - data-volume:/dgraph
     ports:
@@ -109,11 +116,11 @@ services:
     deploy:
       placement:
         constraints:
-          - node.hostname == host4
-    command: dgraph server --my=server_4:7083 --memory_mb=2048 --zero=zero_1:5080 -o 3
-  server_5:
-    image: dgraph/dgraph:test
-    hostname: "server_5"
+          - node.hostname == aws04
+    command: dgraph alpha --my=alpha_4:7083 --lru_mb=2048 --zero=zero_1:5080 -o 3
+  alpha_5:
+    image: dgraph/dgraph:latest
+    hostname: "alpha_5"
     volumes:
       - data-volume:/dgraph
     ports:
@@ -124,11 +131,11 @@ services:
     deploy:
       placement:
         constraints:
-          - node.hostname == host5
-    command: dgraph server --my=server_5:7084 --memory_mb=2048 --zero=zero_1:5080 -o 4
-  server_6:
-    image: dgraph/dgraph:test
-    hostname: "server_6"
+          - node.hostname == aws05
+    command: dgraph alpha --my=alpha_5:7084 --lru_mb=2048 --zero=zero_1:5080 -o 4
+  alpha_6:
+    image: dgraph/dgraph:latest
+    hostname: "alpha_6"
     volumes:
       - data-volume:/dgraph
     ports:
@@ -139,8 +146,15 @@ services:
     deploy:
       placement:
         constraints:
-          - node.hostname == host6
-    command: dgraph server --my=server_6:7085 --memory_mb=2048 --zero=zero_1:5080 -o 5
-
+          - node.hostname == aws06
+    command: dgraph alpha --my=alpha_6:7085 --lru_mb=2048 --zero=zero_1:5080 -o 5
+  ratel:
+    image: dgraph/dgraph:latest
+    hostname: "ratel"
+    ports:
+      - 8000:8000
+    networks:
+      - dgraph
+    command: dgraph-ratel
 volumes:
   data-volume:

@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
@@ -26,15 +25,16 @@ import (
 	"testing"
 
 	"github.com/dgraph-io/badger"
+	"github.com/golang/glog"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
 	"github.com/dgraph-io/dgraph/posting"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 )
 
-func checkShard(ps *badger.ManagedDB) (int, []byte) {
+func checkShard(ps *badger.DB) (int, []byte) {
 	txn := pstore.NewTransactionAt(math.MaxUint64, false)
 	defer txn.Discard()
 	iterOpts := badger.DefaultIteratorOptions
@@ -56,45 +56,46 @@ func checkShard(ps *badger.ManagedDB) (int, []byte) {
 
 func commitTs(startTs uint64) uint64 {
 	commit := timestamp()
-	od := &intern.OracleDelta{
-		Commits: map[uint64]uint64{
-			startTs: commit,
-		},
-		MaxPending: atomic.LoadUint64(&ts),
+	od := &pb.OracleDelta{
+		MaxAssigned: atomic.LoadUint64(&ts),
 	}
-	posting.Oracle().ProcessOracleDelta(od)
+	od.Txns = append(od.Txns, &pb.TxnStatus{StartTs: startTs, CommitTs: commit})
+	posting.Oracle().ProcessDelta(od)
 	return commit
 }
 
-func commitTransaction(t *testing.T, edge *intern.DirectedEdge, l *posting.List) {
+func commitTransaction(t *testing.T, edge *pb.DirectedEdge, l *posting.List) {
 	startTs := timestamp()
-	txn := &posting.Txn{
-		StartTs: startTs,
-	}
-	txn = posting.Txns().PutOrMergeIndex(txn)
+	txn := posting.Oracle().RegisterStartTs(startTs)
+	l = txn.Store(l)
 	err := l.AddMutationWithIndex(context.Background(), edge, txn)
 	require.NoError(t, err)
 
 	commit := commitTs(startTs)
-	require.NoError(t, txn.CommitMutations(context.Background(), commit))
+
+	txn.Update()
+	writer := posting.NewTxnWriter(pstore)
+	require.NoError(t, txn.CommitToDisk(writer, commit))
+	require.NoError(t, writer.Flush())
 }
 
 // Hacky tests change laster
 func writePLs(t *testing.T, pred string, startIdx int, count int, vid uint64) {
 	for i := 0; i < count; i++ {
 		k := x.DataKey(pred, uint64(i+startIdx))
-		list := posting.Get(k)
+		list, err := posting.GetNoStore(k)
+		require.NoError(t, err)
 
-		de := &intern.DirectedEdge{
+		de := &pb.DirectedEdge{
 			ValueId: vid,
 			Label:   "test",
-			Op:      intern.DirectedEdge_SET,
+			Op:      pb.DirectedEdge_SET,
 		}
 		commitTransaction(t, de, list)
 	}
 }
 
-func deletePLs(t *testing.T, pred string, startIdx int, count int, ps *badger.ManagedDB) {
+func deletePLs(t *testing.T, pred string, startIdx int, count int, ps *badger.DB) {
 	for i := 0; i < count; i++ {
 		k := x.DataKey(pred, uint64(i+startIdx))
 		err := ps.Update(func(txn *badger.Txn) error {
@@ -104,10 +105,10 @@ func deletePLs(t *testing.T, pred string, startIdx int, count int, ps *badger.Ma
 	}
 }
 
-func writeToBadger(t *testing.T, pred string, startIdx int, count int, ps *badger.ManagedDB) {
+func writeToBadger(t *testing.T, pred string, startIdx int, count int, ps *badger.DB) {
 	for i := 0; i < count; i++ {
 		k := x.DataKey(pred, uint64(i+startIdx))
-		pl := new(intern.PostingList)
+		pl := new(pb.PostingList)
 		data, err := pl.Marshal()
 		if err != nil {
 			t.Errorf("Error while marshing pl")
@@ -130,14 +131,14 @@ func newServer(port string) (*grpc.Server, net.Listener, error) {
 		log.Fatalf("While running server: %v", err)
 		return nil, nil, err
 	}
-	x.Printf("Worker listening at address: %v", ln.Addr())
+	glog.Infof("Worker listening at address: %v", ln.Addr())
 
 	s := grpc.NewServer()
 	return s, ln, nil
 }
 
 func serve(s *grpc.Server, ln net.Listener) {
-	intern.RegisterWorkerServer(s, &grpcWorker{})
+	pb.RegisterWorkerServer(s, &grpcWorker{})
 	s.Serve(ln)
 }
 
@@ -208,7 +209,7 @@ func TestPopulateShard(t *testing.T) {
 	//		t.Error("Unable to find added elements in posting list")
 	//	}
 	//	var found bool
-	//	l.Iterate(math.MaxUint64, 0, func(p *intern.Posting) bool {
+	//	l.Iterate(math.MaxUint64, 0, func(p *pb.Posting) bool {
 	//		if p.Uid != 2 {
 	//			t.Errorf("Expected 2. Got: %v", p.Uid)
 	//		}
@@ -250,7 +251,7 @@ func TestPopulateShard(t *testing.T) {
 	//			return err
 	//		}
 	//		if len(val) == 0 {
-	//			return x.Errorf("value for uid 1 predicate name not found\n")
+	//			return errors.Errorf("value for uid 1 predicate name not found\n")
 	//		}
 	//		return nil
 	//	})
@@ -284,7 +285,7 @@ func TestPopulateShard(t *testing.T) {
 	//	}
 	//	require.NoError(t, item.Value(func(val []byte) error {
 	//		if len(val) != 0 {
-	//			return x.Errorf("value for uid 1 predicate name shouldn't be present\n")
+	//			return errors.Errorf("value for uid 1 predicate name shouldn't be present\n")
 	//		}
 	//		return nil
 	//	}))
@@ -294,7 +295,7 @@ func TestPopulateShard(t *testing.T) {
 	//	}
 	//	require.NoError(t, item.Value(func(val []byte) error {
 	//		if len(val) != 0 {
-	//			return x.Errorf("value for uid 1 predicate name shouldn't be present\n")
+	//			return errors.Errorf("value for uid 1 predicate name shouldn't be present\n")
 	//		}
 	//		return nil
 	//	}))

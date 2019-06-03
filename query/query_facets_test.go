@@ -1,101 +1,84 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package query
 
 import (
+	"context"
+	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/dgraph-io/dgraph/types"
-	"github.com/dgraph-io/dgraph/x"
 )
 
-func populateGraphWithFacets(t *testing.T) {
-	x.AssertTrue(ps != nil)
-	// So, user we're interested in has uid: 1.
-	// She has 5 friends: 23, 24, 25, 31, and 101
-	friendFacets1 := map[string]string{"since": "2006-01-02T15:04:05"}
-	friendFacets2 := map[string]string{
-		"since": "2005-05-02T15:04:05", "close": "true", "family": "false", "age": "33"}
-	friendFacets3 := map[string]string{
-		"since": "2004-05-02T15:04:05", "close": "true", "family": "true", "tag": "\"Domain3\""}
-	friendFacets4 := map[string]string{
-		"since": "2007-05-02T15:04:05", "close": "false", "family": "true", "tag": "34"}
-	addEdgeToUID(t, "friend", 1, 23, friendFacets1)
-	addEdgeToUID(t, "friend", 1, 24, friendFacets3)
-	addEdgeToUID(t, "friend", 1, 25, friendFacets4)
-	addEdgeToUID(t, "friend", 1, 31, friendFacets1)
-	addEdgeToUID(t, "friend", 1, 101, friendFacets2)
-	addEdgeToUID(t, "friend", 31, 24, nil)
-	addEdgeToUID(t, "friend", 23, 1, friendFacets1)
-	addEdgeToUID(t, "schools", 33, 2433, nil)
+var (
+	facetSetupDone = false
+)
 
-	friendFacets5 := map[string]string{
-		"games": `"football basketball chess tennis"`, "close": "false", "age": "35"}
-	friendFacets6 := map[string]string{
-		"games": `"football basketball hockey"`, "close": "false"}
+func populateClusterWithFacets() {
+	// Return immediately if the setup has been performed already.
+	if facetSetupDone {
+		return
+	}
 
-	addEdgeToUID(t, "friend", 31, 1, friendFacets5)
-	addEdgeToUID(t, "friend", 31, 25, friendFacets6)
+	triples := `
+		<25> <name> "Daryl Dixon" .
+		<31> <name> "Andrea" .
+		<33> <name> "Michale" .
+		<320> <name> "Test facet"@en (type = "Test facet with lang") .
 
-	nameFacets := map[string]string{"origin": `"french"`}
-	// Now let's add a few properties for the main user.
-	addEdgeToValue(t, "name", 1, "Michonne", nameFacets)
-	addEdgeToValue(t, "gender", 1, "female", nil)
+		<31> <friend> <24> .
 
-	// Now let's add a name for each of the friends, except 101.
-	addEdgeToTypedValue(t, "name", 23, types.StringID, []byte("Rick Grimes"), nameFacets)
-	addEdgeToValue(t, "gender", 23, "male", nil)
-	addEdgeToValue(t, "name", 24, "Glenn Rhee", nameFacets)
-	addEdgeToValue(t, "name", 25, "Daryl Dixon", nil)
+		<33> <schools> <2433> .
 
-	addEdgeToValue(t, "name", 31, "Andrea", nil)
+		<1> <gender> "female" .
+		<23> <gender> "male" .
 
-	addEdgeToValue(t, "name", 33, "Michale", nil)
-	// missing name for 101 -- no name edge and no facets.
+		<202> <model> "Prius" (type = "Electric") .
+	`
 
-	addEdgeToLangValue(t, "name", 320, "Test facet", "en",
-		map[string]string{"type": `"Test facet with lang"`})
+	friendFacets1 := "(since = 2006-01-02T15:04:05)"
+	friendFacets2 := "(since = 2005-05-02T15:04:05, close = true, family = false, age = 33)"
+	friendFacets3 := "(since = 2004-05-02T15:04:05, close = true, family = true, tag = \"Domain3\")"
+	friendFacets4 := "(since = 2007-05-02T15:04:05, close = false, family = true, tag = 34)"
+	friendFacets5 := "(games = \"football basketball chess tennis\", close = false, age = 35)"
+	friendFacets6 := "(games = \"football basketball hockey\", close = false)"
 
-	time.Sleep(5 * time.Millisecond)
-}
+	triples += fmt.Sprintf("<1> <friend> <23> %s .\n", friendFacets1)
+	triples += fmt.Sprintf("<1> <friend> <24> %s .\n", friendFacets3)
+	triples += fmt.Sprintf("<1> <friend> <25> %s .\n", friendFacets4)
+	triples += fmt.Sprintf("<1> <friend> <31> %s .\n", friendFacets1)
+	triples += fmt.Sprintf("<1> <friend> <101> %s .\n", friendFacets2)
+	triples += fmt.Sprintf("<23> <friend> <1> %s .\n", friendFacets1)
+	triples += fmt.Sprintf("<31> <friend> <1> %s .\n", friendFacets5)
+	triples += fmt.Sprintf("<31> <friend> <25> %s .\n", friendFacets6)
 
-// teardownGraphWithFacets removes friend edges otherwise tests in query_test.go
-// are affected by populateGraphWithFacets.
-func teardownGraphWithFacets(t *testing.T) {
-	delEdgeToUID(t, "friend", 1, 23)
-	delEdgeToUID(t, "friend", 1, 24)
-	delEdgeToUID(t, "friend", 1, 25)
-	delEdgeToUID(t, "friend", 1, 31)
-	delEdgeToUID(t, "friend", 1, 101)
-	delEdgeToUID(t, "friend", 31, 24)
-	delEdgeToUID(t, "friend", 23, 1)
-	delEdgeToUID(t, "friend", 31, 1)
-	delEdgeToUID(t, "friend", 31, 25)
-	delEdgeToUID(t, "schools", 33, 2433)
-	delEdgeToLangValue(t, "name", 320, "Test facet", "en")
+	nameFacets := "(origin = \"french\")"
+	triples += fmt.Sprintf("<1> <name> \"Michonne\" %s .\n", nameFacets)
+	triples += fmt.Sprintf("<23> <name> \"Rick Grimes\" %s .\n", nameFacets)
+	triples += fmt.Sprintf("<24> <name> \"Glenn Rhee\" %s .\n", nameFacets)
+
+	addTriplesToCluster(triples)
+
+	// Mark the setup as done so that the next tests do not have to perform it.
+	facetSetupDone = true
 }
 
 func TestRetrieveFacetsSimple(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(0x1)) {
@@ -105,15 +88,14 @@ func TestRetrieveFacetsSimple(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"name|origin":"french","name":"Michonne","gender":"female"}]}}`,
 		js)
 }
 
 func TestOrderFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// to see how friend @facets are positioned in output.
 	query := `
 		{
@@ -125,15 +107,14 @@ func TestOrderFacets(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"friend":[{"name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"},{"friend|since":"2005-05-02T15:04:05Z"},{"name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"}]}]}}`,
 		js)
 }
 
 func TestOrderdescFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// to see how friend @facets are positioned in output.
 	query := `
 		{
@@ -145,15 +126,37 @@ func TestOrderdescFacets(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t,
+		`{"data":{"me":[{"friend":[{"name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"},{"name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"friend|since":"2005-05-02T15:04:05Z"},{"name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"}]}]}}`,
+		js)
+}
+
+func TestOrderdescFacetsWithFilters(t *testing.T) {
+	populateClusterWithFacets()
+	query := `
+		{
+
+			var(func: uid(1)) {
+				f as friend
+			}
+
+			me(func: uid(1)) {
+				friend @filter(uid(f)) @facets(orderdesc:since) {
+					name
+				}
+			}
+		}
+	`
+
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"friend":[{"name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"},{"name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"friend|since":"2005-05-02T15:04:05Z"},{"name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"}]}]}}`,
 		js)
 }
 
 func TestRetrieveFacetsAsVars(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// to see how friend @facets are positioned in output.
 	query := `
 		{
@@ -168,15 +171,14 @@ func TestRetrieveFacetsAsVars(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"name":"Rick Grimes","val(a)":"2006-01-02T15:04:05Z"}]}}`,
 		js)
 }
 
 func TestRetrieveFacetsUidValues(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// to see how friend @facets are positioned in output.
 	query := `
 		{
@@ -188,15 +190,14 @@ func TestRetrieveFacetsUidValues(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"friend":[{"name|origin":"french","name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"name|origin":"french","name":"Glenn Rhee","friend|close":true,"friend|family":true,"friend|since":"2004-05-02T15:04:05Z","friend|tag":"Domain3"},{"name":"Daryl Dixon","friend|close":false,"friend|family":true,"friend|since":"2007-05-02T15:04:05Z","friend|tag":34},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"friend|age":33,"friend|close":true,"friend|family":false,"friend|since":"2005-05-02T15:04:05Z"}]}]}}`,
 		js)
 }
 
 func TestRetrieveFacetsAll(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(0x1)) {
@@ -210,15 +211,14 @@ func TestRetrieveFacetsAll(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"name|origin":"french","name":"Michonne","friend":[{"name|origin":"french","name":"Rick Grimes","gender":"male","friend|since":"2006-01-02T15:04:05Z"},{"name|origin":"french","name":"Glenn Rhee","friend|close":true,"friend|family":true,"friend|since":"2004-05-02T15:04:05Z","friend|tag":"Domain3"},{"name":"Daryl Dixon","friend|close":false,"friend|family":true,"friend|since":"2007-05-02T15:04:05Z","friend|tag":34},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"friend|age":33,"friend|close":true,"friend|family":false,"friend|since":"2005-05-02T15:04:05Z"}],"gender":"female"}]}}`,
 		js)
 }
 
 func TestFacetsNotInQuery(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(0x1)) {
@@ -232,15 +232,14 @@ func TestFacetsNotInQuery(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"gender":"male","name":"Rick Grimes"},{"name":"Glenn Rhee"},{"name":"Daryl Dixon"},{"name":"Andrea"}],"gender":"female","name":"Michonne"}]}}`,
 		js)
 }
 
 func TestSubjectWithNoFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// id 33 does not have any facets associated with name and school
 	query := `
 		{
@@ -252,15 +251,14 @@ func TestSubjectWithNoFacets(t *testing.T) {
 			}
 		}
 	`
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"name":"Michale"}]}}`,
 		js)
 }
 
 func TestFetchingFewFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// only 1 friend of 1 has facet : "close" and she/he has no name
 	query := `
 		{
@@ -273,15 +271,14 @@ func TestFetchingFewFacets(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"name":"Michonne","friend":[{"name":"Rick Grimes"},{"name":"Glenn Rhee","friend|close":true},{"name":"Daryl Dixon","friend|close":false},{"name":"Andrea"},{"friend|close":true}]}]}}`,
 		js)
 }
 
 func TestFetchingNoFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// TestFetchingFewFacets but without the facet.  Returns no facets.
 	query := `
 		{
@@ -294,15 +291,14 @@ func TestFetchingNoFacets(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"name":"Rick Grimes"},{"name":"Glenn Rhee"},{"name":"Daryl Dixon"},{"name":"Andrea"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsSortOrder(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// order of facets in gql query should not matter.
 	query := `
 		{
@@ -315,15 +311,14 @@ func TestFacetsSortOrder(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"name":"Michonne","friend":[{"name":"Rick Grimes"},{"name":"Glenn Rhee","friend|close":true,"friend|family":true},{"name":"Daryl Dixon","friend|close":false,"friend|family":true},{"name":"Andrea"},{"friend|close":true,"friend|family":false}]}]}}`,
 		js)
 }
 
 func TestUnknownFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// uknown facets should be ignored.
 	query := `
 		{
@@ -336,18 +331,24 @@ func TestUnknownFacets(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"name":"Rick Grimes"},{"name":"Glenn Rhee"},{"name":"Daryl Dixon"},{"name":"Andrea"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsMutation(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
-	delEdgeToUID(t, "friend", 1, 24) // Delete friendship between Michonne and Glenn
-	friendFacets := map[string]string{"since": "2001-11-10T00:00:00Z", "close": "false", "family": "false"}
-	addEdgeToUID(t, "friend", 1, 101, friendFacets) // and 101 is not close friend now.
+	populateClusterWithFacets()
+
+	// Delete friendship between Michonne and Glenn
+	deleteTriplesInCluster("<1> <friend> <24> .")
+	friendFacets := "(since = 2001-11-10T00:00:00Z, close = false, family = false)"
+	// 101 is not close friend now.
+	addTriplesToCluster(fmt.Sprintf(`<1> <friend> <101> %s .`, friendFacets))
+	// This test messes with the test setup, so set facetSetupDone to false so
+	// the next test redoes the setup.
+	facetSetupDone = false
+
 	query := `
 		{
 			me(func: uid(0x1)) {
@@ -359,15 +360,14 @@ func TestFacetsMutation(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"name":"Michonne","friend":[{"name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"name":"Daryl Dixon","friend|close":false,"friend|family":true,"friend|since":"2007-05-02T15:04:05Z","friend|tag":34},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"friend|close":false,"friend|family":false,"friend|since":"2001-11-10T00:00:00Z"}]}]}}`,
 		js)
 }
 
 func TestFacetsFilterSimple(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find close friends of 1
 	query := `
 		{
@@ -381,7 +381,7 @@ func TestFacetsFilterSimple(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	// 0x65 does not have name.
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x18","name":"Glenn Rhee"},{"uid":"0x65"}],"name":"Michonne"}]}}`,
@@ -389,8 +389,7 @@ func TestFacetsFilterSimple(t *testing.T) {
 }
 
 func TestFacetsFilterSimple2(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find close friends of 1
 	query := `
 		{
@@ -404,15 +403,14 @@ func TestFacetsFilterSimple2(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x18","name":"Glenn Rhee"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterSimple3(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find close friends of 1
 	query := `
 		{
@@ -426,15 +424,14 @@ func TestFacetsFilterSimple3(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x19","name":"Daryl Dixon"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterOr(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find close or family friends of 1
 	query := `
 		{
@@ -448,7 +445,7 @@ func TestFacetsFilterOr(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	// 0x65 (101) does not have name.
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x18","name":"Glenn Rhee"},{"uid":"0x19","name":"Daryl Dixon"},{"uid":"0x65"}],"name":"Michonne"}]}}`,
@@ -456,8 +453,7 @@ func TestFacetsFilterOr(t *testing.T) {
 }
 
 func TestFacetsFilterAnd(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// unknown filters do not have any effect on results.
 	query := `
 		{
@@ -471,15 +467,14 @@ func TestFacetsFilterAnd(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x65"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterle(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find friends of 1 below 36 years of age.
 	query := `
 		{
@@ -493,15 +488,14 @@ func TestFacetsFilterle(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x65"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterge(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find friends of 1 above 32 years of age.
 	query := `
 		{
@@ -515,15 +509,14 @@ func TestFacetsFilterge(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x65"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAndOrle(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find close or family friends of 1 before 2007-01-10
 	query := `
 		{
@@ -537,7 +530,7 @@ func TestFacetsFilterAndOrle(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	// 0x65 (101) does not have name.
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x18","name":"Glenn Rhee"},{"uid":"0x65"}],"name":"Michonne"}]}}`,
@@ -545,8 +538,7 @@ func TestFacetsFilterAndOrle(t *testing.T) {
 }
 
 func TestFacetsFilterAndOrge2(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find close or family friends of 1 after 2007-01-10
 	query := `
 		{
@@ -560,15 +552,14 @@ func TestFacetsFilterAndOrge2(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x19","name":"Daryl Dixon"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterNotAndOrgeMutuallyExclusive(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// find Not (close or family friends of 1 after 2007-01-10)
 	// Mutually exclusive of above result : TestFacetsFilterNotAndOrge
 	query := `
@@ -583,15 +574,14 @@ func TestFacetsFilterNotAndOrgeMutuallyExclusive(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x17","name":"Rick Grimes"},{"uid":"0x18","name":"Glenn Rhee"},{"uid":"0x1f","name":"Andrea"},{"uid":"0x65"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterUnknownFacets(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// unknown facets should filter out edges.
 	query := `
 		{
@@ -605,15 +595,14 @@ func TestFacetsFilterUnknownFacets(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterUnknownOrKnown(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// unknown filters with OR do not have any effect on results
 	query := `
 		{
@@ -627,15 +616,14 @@ func TestFacetsFilterUnknownOrKnown(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x18","name":"Glenn Rhee"},{"uid":"0x19","name":"Daryl Dixon"}],"name":"Michonne"}]}}`,
 		js)
 }
 
 func TestFacetsFilterallofterms(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(31)) {
@@ -648,15 +636,14 @@ func TestFacetsFilterallofterms(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"name":"Michonne","uid":"0x1"}],"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAllofMultiple(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(31)) {
@@ -669,15 +656,14 @@ func TestFacetsFilterAllofMultiple(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"name":"Michonne","uid":"0x1"}, {"name":"Daryl Dixon","uid":"0x19"}],"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAllofNone(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// nothing matches in allofterms
 	query := `
 		{
@@ -691,15 +677,14 @@ func TestFacetsFilterAllofNone(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilteranyofterms(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(31)) {
@@ -712,15 +697,14 @@ func TestFacetsFilteranyofterms(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x1","name":"Michonne"}],"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAnyofNone(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(31)) {
@@ -733,15 +717,14 @@ func TestFacetsFilterAnyofNone(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAllofanyofterms(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(31)) {
@@ -754,15 +737,14 @@ func TestFacetsFilterAllofanyofterms(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x1","name":"Michonne"},{"uid":"0x19","name":"Daryl Dixon"}],"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAllofAndanyofterms(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(31)) {
@@ -775,15 +757,14 @@ func TestFacetsFilterAllofAndanyofterms(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"me":[{"friend":[{"uid":"0x19","name":"Daryl Dixon"}],"name":"Andrea"}]}}`,
 		js)
 }
 
 func TestFacetsFilterAtValueFail(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// facet filtering is not supported at value level.
 	query := `
 	{
@@ -795,13 +776,12 @@ func TestFacetsFilterAtValueFail(t *testing.T) {
 	}
 `
 
-	_, err := processToFastJson(t, query)
+	_, err := processQuery(context.Background(), t, query)
 	require.Error(t, err)
 }
 
 func TestFacetsFilterAndRetrieval(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	// Close should not be retrieved.. only used for filtering.
 	query := `
 		{
@@ -815,15 +795,14 @@ func TestFacetsFilterAndRetrieval(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data":{"me":[{"name":"Michonne","friend":[{"name":"Glenn Rhee","uid":"0x18","friend|family":true},{"uid":"0x65","friend|family":false}]}]}}`,
 		js)
 }
 
 func TestFacetWithLang(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(320)) {
@@ -832,13 +811,12 @@ func TestFacetWithLang(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t, `{"data":{"me":[{"name@en|type":"Test facet with lang","name@en":"Test facet"}]}}`, js)
 }
 
 func TestFilterUidFacetMismatch(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 	{
 		me(func: uid(0x1)) {
@@ -848,13 +826,12 @@ func TestFilterUidFacetMismatch(t *testing.T) {
 		}
 	}
 	`
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t, `{"data":{"me":[{"friend":[{"name":"Glenn Rhee","friend|close":true,"friend|family":true,"friend|since":"2004-05-02T15:04:05Z","friend|tag":"Domain3"},{"friend|age":33,"friend|close":true,"friend|family":false,"friend|since":"2005-05-02T15:04:05Z"}]}]}}`, js)
 }
 
 func TestRecurseFacetOrder(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
     {
 		me(func: uid(1)) @recurse(depth: 2) {
@@ -864,8 +841,14 @@ func TestRecurseFacetOrder(t *testing.T) {
 		}
 	}
   `
-	js := processToFastJsonNoErr(t, query)
-	require.JSONEq(t, `{"data":{"me":[{"friend":[{"uid":"0x19","name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"},{"friend":[{"friend|since":"2006-01-02T15:04:05Z"}],"uid":"0x17","name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"uid":"0x1f","name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"uid":"0x65","friend|since":"2005-05-02T15:04:05Z"},{"uid":"0x18","name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"}],"uid":"0x1","name":"Michonne"}]}}`, js)
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"friend":[
+			{"uid":"0x19","name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"},
+			{"uid":"0x17","name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},
+			{"uid":"0x1f","name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},
+			{"uid":"0x65","friend|since":"2005-05-02T15:04:05Z"},
+			{"uid":"0x18","name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"}],
+		"uid":"0x1","name":"Michonne"}]}}`, js)
 
 	query = `
     {
@@ -876,13 +859,18 @@ func TestRecurseFacetOrder(t *testing.T) {
 		}
 	}
   `
-	js = processToFastJsonNoErr(t, query)
-	require.JSONEq(t, `{"data":{"me":[{"friend":[{"uid":"0x18","name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"},{"uid":"0x65","friend|since":"2005-05-02T15:04:05Z"},{"friend":[{"friend|since":"2006-01-02T15:04:05Z"}],"uid":"0x17","name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"uid":"0x1f","name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"uid":"0x19","name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"}],"uid":"0x1","name":"Michonne"}]}}`, js)
+	js = processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"friend":[
+			{"uid":"0x18","name":"Glenn Rhee","friend|since":"2004-05-02T15:04:05Z"},
+			{"uid":"0x65","friend|since":"2005-05-02T15:04:05Z"},
+			{"uid":"0x17","name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},
+			{"uid":"0x1f","name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},
+			{"uid":"0x19","name":"Daryl Dixon","friend|since":"2007-05-02T15:04:05Z"}],
+		"uid":"0x1","name":"Michonne"}]}}`, js)
 }
 
 func TestFacetsAlias(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me(func: uid(0x1)) {
@@ -894,13 +882,12 @@ func TestFacetsAlias(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.Equal(t, `{"data":{"me":[{"o":"french","name":"Michonne","friend":[{"o":"french","name":"Rick Grimes","friend|since":"2006-01-02T15:04:05Z"},{"o":"french","name":"Glenn Rhee","friend|family":true,"friend|since":"2004-05-02T15:04:05Z","tagalias":"Domain3"},{"name":"Daryl Dixon","friend|family":true,"friend|since":"2007-05-02T15:04:05Z","tagalias":34},{"name":"Andrea","friend|since":"2006-01-02T15:04:05Z"},{"friend|family":false,"friend|since":"2005-05-02T15:04:05Z"}]}]}}`, js)
 }
 
 func TestFacetsAlias2(t *testing.T) {
-	populateGraphWithFacets(t)
-	defer teardownGraphWithFacets(t)
+	populateClusterWithFacets()
 	query := `
 		{
 			me2(func: uid(0x1)) {
@@ -914,6 +901,20 @@ func TestFacetsAlias2(t *testing.T) {
 		}
 	`
 
-	js := processToFastJsonNoErr(t, query)
+	js := processQueryNoErr(t, query)
 	require.JSONEq(t, `{"data":{"me2":[{"friend":[{"friend|close":true,"f":false,"friend|since":"2005-05-02T15:04:05Z"},{"friend|since":"2006-01-02T15:04:05Z"},{"friend|since":"2006-01-02T15:04:05Z"},{"friend|close":true,"f":true,"friend|since":"2004-05-02T15:04:05Z","friend|tag":"Domain3"},{"friend|close":false,"f":true,"friend|since":"2007-05-02T15:04:05Z","friend|tag":34}]}],"me":[{"name":"Rick Grimes", "val(a)":"2006-01-02T15:04:05Z"}]}}`, js)
+}
+
+func TestTypeExpandFacets(t *testing.T) {
+	query := `{
+		q(func: eq(make, "Toyota")) {
+			expand(_all_) {
+				uid
+			}
+		}
+	}`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data": {"q":[
+		{"make":"Toyota","model":"Prius", "model@jp":"プリウス", "model|type":"Electric",
+			"year":2009}]}}`, js)
 }

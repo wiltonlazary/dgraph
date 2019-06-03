@@ -1,49 +1,39 @@
 #!/bin/bash
+# Containers MUST be labeled with "cluster:test" to be restarted and stopped
+# by these functions.
 
-
-sleepTime=11
-
-function quit {
-  echo "Shutting down dgraph server and zero"
-  curl -s localhost:8081/admin/shutdown
-  curl -s localhost:8082/admin/shutdown
-  # Kill Dgraphzero
-  kill -9 $(pgrep -f "dgraph zero") > /dev/null
-
-  if pgrep -x dgraph > /dev/null
-  then
-    while pgrep dgraph;
-    do
-      echo "Sleeping for 5 secs so that Dgraph can shutdown."
-      sleep 5
-    done
+# May be called with an argument which is a docker compose file
+# to use *instead of* the default docker-compose.yml.
+function restartCluster {
+  if [[ -z $1 ]]; then
+    compose_file="docker-compose.yml"
+  else
+    compose_file="$(readlink -f $1)"
   fi
 
-  echo "Clean shutdown done."
-  return $1
+  basedir=$GOPATH/src/github.com/dgraph-io/dgraph
+  pushd $basedir/dgraph >/dev/null
+  echo "Rebuilding dgraph ..."
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    (env GOOS=linux GOARCH=amd64 go build) && mv -f dgraph $GOPATH/bin/dgraph
+  else
+    make install
+  fi
+  docker ps -a --filter label="cluster=test" --format "{{.Names}}" | xargs -r docker rm -f
+  docker-compose -p dgraph -f $compose_file up --force-recreate --remove-orphans --detach || exit 1
+  popd >/dev/null
+
+  $basedir/contrib/wait-for-it.sh -t 60 localhost:6180 || exit 1
+  $basedir/contrib/wait-for-it.sh -t 60 localhost:9180 || exit 1
+  sleep 10 || exit 1
 }
 
-function start {
-  pushd dgraph &> /dev/null
-  echo -e "Starting first server."
-  ./dgraph server -p $BUILD/p -w $BUILD/w --memory_mb 4096 -o 1 &
-  sleep 5
-  echo -e "Starting second server.\n"
-  ./dgraph server -p $BUILD/p2 -w $BUILD/w2 --memory_mb 4096 -o 2 &
-  # Wait for membership sync to happen.
-  sleep $sleepTime
-  popd &> /dev/null
-  return 0
-}
-
-function startZero {
-  pushd dgraph &> /dev/null
-  echo -e "\nBuilding Dgraph."
-  go build .
-	echo -e "Starting dgraph zero.\n"
-  ./dgraph zero -w $BUILD/wz &
-  # To ensure dgraph doesn't start before dgraphzero.
-	# It takes time for zero to start on travis(mac).
-	sleep $sleepTime
-  popd &> /dev/null
+function stopCluster {
+  basedir=$GOPATH/src/github.com/dgraph-io/dgraph
+  pushd $basedir/dgraph >/dev/null
+  docker ps --filter label="cluster=test" --format "{{.Names}}" \
+  | xargs -r docker stop | sed 's/^/Stopped /'
+  docker ps -a --filter label="cluster=test" --format "{{.Names}}" \
+  | xargs -r docker rm | sed 's/^/Removed /'
+  popd >/dev/null
 }

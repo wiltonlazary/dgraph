@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,71 +19,85 @@ package types
 import (
 	"time"
 
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	geom "github.com/twpayne/go-geom"
 )
 
-const (
-	nanoSecondsInSec = 1000000000
-)
+const nanoSecondsInSec = 1000000000
 
 // Note: These ids are stored in the posting lists to indicate the type
 // of the data. The order *cannot* be changed without breaking existing
 // data. When adding a new type *always* add to the end of this list.
 // Never delete anything from this list even if it becomes unused.
 const (
-	BinaryID   = TypeID(intern.Posting_BINARY)
-	IntID      = TypeID(intern.Posting_INT)
-	FloatID    = TypeID(intern.Posting_FLOAT)
-	BoolID     = TypeID(intern.Posting_BOOL)
-	DateTimeID = TypeID(intern.Posting_DATETIME)
-	StringID   = TypeID(intern.Posting_STRING)
-	GeoID      = TypeID(intern.Posting_GEO)
-	UidID      = TypeID(intern.Posting_UID)
-	PasswordID = TypeID(intern.Posting_PASSWORD)
-	DefaultID  = TypeID(intern.Posting_DEFAULT)
+	// DefaultID represents the default type.
+	DefaultID = TypeID(pb.Posting_DEFAULT)
+	// BinaryID represents the binary data type.
+	BinaryID = TypeID(pb.Posting_BINARY)
+	// IntID represents the integer type.
+	IntID = TypeID(pb.Posting_INT)
+	// FloatID represents the floating-point number type.
+	FloatID = TypeID(pb.Posting_FLOAT)
+	// FloatID represents the boolean type.
+	BoolID = TypeID(pb.Posting_BOOL)
+	// DateTimeID represents the datetime type.
+	DateTimeID = TypeID(pb.Posting_DATETIME)
+	// GeoID represents the geo-location data type.
+	GeoID = TypeID(pb.Posting_GEO)
+	// UidID represents the uid type.
+	UidID = TypeID(pb.Posting_UID)
+	// PasswordID represents the password type.
+	PasswordID = TypeID(pb.Posting_PASSWORD)
+	// StringID represents the string type.
+	StringID = TypeID(pb.Posting_STRING)
+	// UndefinedID represents the undefined type.
+	UndefinedID = TypeID(100)
 )
 
 var typeNameMap = map[string]TypeID{
+	"default":  DefaultID,
+	"binary":   BinaryID,
 	"int":      IntID,
 	"float":    FloatID,
-	"string":   StringID,
 	"bool":     BoolID,
 	"datetime": DateTimeID,
 	"geo":      GeoID,
 	"uid":      UidID,
+	"string":   StringID,
 	"password": PasswordID,
-	"default":  DefaultID,
 }
 
-type TypeID intern.Posting_ValType
+// TypeID represents the type of the data.
+type TypeID pb.Posting_ValType
 
-func (t TypeID) Enum() intern.Posting_ValType {
-	return intern.Posting_ValType(t)
+// Enum takes a TypeID value and returns the corresponding ValType enum value.
+func (t TypeID) Enum() pb.Posting_ValType {
+	return pb.Posting_ValType(t)
 }
 
+// Name returns the name of the type.
 func (t TypeID) Name() string {
 	switch t {
+	case DefaultID:
+		return "default"
+	case BinaryID:
+		return "binary"
 	case IntID:
 		return "int"
 	case FloatID:
 		return "float"
 	case BoolID:
 		return "bool"
-	case StringID:
-		return "string"
 	case DateTimeID:
 		return "datetime"
 	case GeoID:
 		return "geo"
 	case UidID:
 		return "uid"
+	case StringID:
+		return "string"
 	case PasswordID:
 		return "password"
-	case DefaultID:
-		return "default"
-	case BinaryID:
-		return "binary"
 	}
 	return ""
 }
@@ -94,6 +108,20 @@ type Val struct {
 	Value interface{}
 }
 
+// Safe ensures that Val's Value is not nil. This is useful when doing type
+// assertions and default values might be involved.
+// This function won't change the original v.Value, may it be nil.
+// See: "Default value vars" in `fillVars()`
+// Returns a safe v.Value suitable for type assertions.
+func (v Val) Safe() interface{} {
+	if v.Value == nil {
+		// get zero value for this v.Tid
+		va := ValueForType(v.Tid)
+		return va.Value
+	}
+	return v.Value
+}
+
 // TypeForName returns the type corresponding to the given name.
 // If name is not recognized, it returns nil.
 func TypeForName(name string) (TypeID, bool) {
@@ -101,8 +129,14 @@ func TypeForName(name string) (TypeID, bool) {
 	return t, ok
 }
 
+// IsScalar returns whether the type is a scalar type.
 func (t TypeID) IsScalar() bool {
 	return t != UidID
+}
+
+// IsNumber returns whether the type is a number type.
+func (t TypeID) IsNumber() bool {
+	return t == IntID || t == FloatID
 }
 
 // ValueForType returns the zero value for a type id
@@ -153,12 +187,8 @@ func ValueForType(id TypeID) Val {
 	}
 }
 
-func createDate(y int, m time.Month, d int) time.Time {
-	var dt time.Time
-	dt = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-	return dt
-}
-
+// ParseTime parses the time from string trying various datetime formats.
+// By default, Go parses time in UTC unless specified in the data itself.
 func ParseTime(val string) (time.Time, error) {
 	var t time.Time
 	if err := t.UnmarshalText([]byte(val)); err == nil {

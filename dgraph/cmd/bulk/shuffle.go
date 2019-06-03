@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package bulk
@@ -28,7 +27,7 @@ import (
 
 	"github.com/dgraph-io/badger"
 	bo "github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/gogo/protobuf/proto"
 )
@@ -46,11 +45,11 @@ func (s *shuffler) run() {
 	thr := x.NewThrottle(s.opt.NumShufflers)
 	for i := 0; i < s.opt.ReduceShards; i++ {
 		thr.Start()
-		go func(i int, db *badger.ManagedDB) {
-			mapFiles := filenamesInTree(shardDirs[i])
-			shuffleInputChs := make([]chan *intern.MapEntry, len(mapFiles))
+		go func(shardId int, db *badger.DB) {
+			mapFiles := filenamesInTree(shardDirs[shardId])
+			shuffleInputChs := make([]chan *pb.MapEntry, len(mapFiles))
 			for i, mapFile := range mapFiles {
-				shuffleInputChs[i] = make(chan *intern.MapEntry, 1000)
+				shuffleInputChs[i] = make(chan *pb.MapEntry, 1000)
 				go readMapOutput(mapFile, shuffleInputChs[i])
 			}
 
@@ -64,7 +63,7 @@ func (s *shuffler) run() {
 	close(s.output)
 }
 
-func (s *shuffler) createBadger(i int) *badger.ManagedDB {
+func (s *shuffler) createBadger(i int) *badger.DB {
 	opt := badger.DefaultOptions
 	opt.SyncWrites = false
 	opt.TableLoadingMode = bo.MemoryMap
@@ -76,7 +75,7 @@ func (s *shuffler) createBadger(i int) *badger.ManagedDB {
 	return db
 }
 
-func readMapOutput(filename string, mapEntryCh chan<- *intern.MapEntry) {
+func readMapOutput(filename string, mapEntryCh chan<- *pb.MapEntry) {
 	fd, err := os.Open(filename)
 	x.Check(err)
 	defer fd.Close()
@@ -91,7 +90,7 @@ func readMapOutput(filename string, mapEntryCh chan<- *intern.MapEntry) {
 		x.Check(err)
 		sz, n := binary.Uvarint(buf)
 		if n <= 0 {
-			log.Fatal("Could not read uvarint: %d", n)
+			log.Fatalf("Could not read uvarint: %d", n)
 		}
 		x.Check2(r.Discard(n))
 
@@ -100,15 +99,15 @@ func readMapOutput(filename string, mapEntryCh chan<- *intern.MapEntry) {
 		}
 		x.Check2(io.ReadFull(r, unmarshalBuf[:sz]))
 
-		me := new(intern.MapEntry)
+		me := new(pb.MapEntry)
 		x.Check(proto.Unmarshal(unmarshalBuf[:sz], me))
 		mapEntryCh <- me
 	}
+
 	close(mapEntryCh)
 }
 
-func (s *shuffler) shufflePostings(mapEntryChs []chan *intern.MapEntry, ci *countIndexer) {
-
+func (s *shuffler) shufflePostings(mapEntryChs []chan *pb.MapEntry, ci *countIndexer) {
 	var ph postingHeap
 	for _, ch := range mapEntryChs {
 		heap.Push(&ph, heapNode{mapEntry: <-ch, ch: ch})
@@ -116,7 +115,7 @@ func (s *shuffler) shufflePostings(mapEntryChs []chan *intern.MapEntry, ci *coun
 
 	const batchSize = 1000
 	const batchAlloc = batchSize * 11 / 10
-	batch := make([]*intern.MapEntry, 0, batchAlloc)
+	batch := make([]*pb.MapEntry, 0, batchAlloc)
 	var prevKey []byte
 	var plistLen int
 	for len(ph.nodes) > 0 {
@@ -138,7 +137,7 @@ func (s *shuffler) shufflePostings(mapEntryChs []chan *intern.MapEntry, ci *coun
 		if len(batch) >= batchSize && bytes.Compare(prevKey, me.Key) != 0 {
 			s.output <- shuffleOutput{mapEntries: batch, db: ci.db}
 			NumQueuedReduceJobs.Add(1)
-			batch = make([]*intern.MapEntry, 0, batchAlloc)
+			batch = make([]*pb.MapEntry, 0, batchAlloc)
 		}
 		prevKey = me.Key
 		batch = append(batch, me)
@@ -154,8 +153,8 @@ func (s *shuffler) shufflePostings(mapEntryChs []chan *intern.MapEntry, ci *coun
 }
 
 type heapNode struct {
-	mapEntry *intern.MapEntry
-	ch       <-chan *intern.MapEntry
+	mapEntry *pb.MapEntry
+	ch       <-chan *pb.MapEntry
 }
 
 type postingHeap struct {

@@ -1,19 +1,19 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
+
 package query
 
 import (
@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dgraph-io/dgraph/types"
+	"github.com/dgraph-io/dgraph/x"
 )
 
 func makeFastJsonNode() *fastJsonNode {
@@ -59,6 +60,9 @@ func TestEncodeMemory(t *testing.T) {
 }
 
 func TestNormalizeJSONLimit(t *testing.T) {
+	// Set default normalize limit.
+	x.Config.NormalizeNodeLimit = 1e4
+
 	if testing.Short() {
 		t.Skip("Skipping TestNormalizeJSONLimit")
 	}
@@ -88,10 +92,13 @@ func TestNormalizeJSONLimit(t *testing.T) {
 		}
 	}
 	_, err := n.(*fastJsonNode).normalize()
-	require.Error(t, err, "Couldn't evaluate @normalize directive - to many results")
+	require.Error(t, err, "Couldn't evaluate @normalize directive - too many results")
 }
 
 func TestNormalizeJSONUid1(t *testing.T) {
+	// Set default normalize limit.
+	x.Config.NormalizeNodeLimit = 1e4
+
 	n := (&fastJsonNode{}).New("root")
 	require.NotNil(t, n)
 	child1 := n.New("child1")

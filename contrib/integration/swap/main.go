@@ -1,3 +1,19 @@
+/*
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package main
 
 import (
@@ -12,14 +28,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/dgraph/client"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/x"
-	"google.golang.org/grpc"
+	"github.com/dgraph-io/dgo"
+	"github.com/dgraph-io/dgo/protos/api"
+	"github.com/dgraph-io/dgo/x"
+	"github.com/dgraph-io/dgraph/z"
 )
 
 var (
-	dgraAddr  = flag.String("d", "localhost:9081", "dgraph address")
+	alpha     = flag.String("alpha", "localhost:9180", "Dgraph alpha address")
 	timeout   = flag.Int("timeout", 60, "query/mutation timeout")
 	numSents  = flag.Int("sentences", 100, "number of sentences")
 	numSwaps  = flag.Int("swaps", 1000, "number of swaps to attempt")
@@ -42,7 +58,7 @@ func main() {
 	for _, s := range sents {
 		words := strings.Split(s, " ")
 		for _, w := range words {
-			wordCount[w] += 1
+			wordCount[w]++
 		}
 	}
 	type wc struct {
@@ -62,7 +78,7 @@ func main() {
 		fmt.Printf("%15s: %3d\n", w.word, w.count)
 	}
 
-	c := newClient()
+	c := z.DgraphClientWithGroot(*alpha)
 	uids := setup(c, sents)
 
 	// Check invariants before doing any mutations as a sanity check.
@@ -150,15 +166,7 @@ func createSentences(n int) []string {
 	}
 }
 
-func newClient() *client.Dgraph {
-	d, err := grpc.Dial(*dgraAddr, grpc.WithInsecure())
-	x.Check(err)
-	return client.NewDgraphClient(
-		api.NewDgraphClient(d),
-	)
-}
-
-func setup(c *client.Dgraph, sentences []string) []string {
+func setup(c *dgo.Dgraph, sentences []string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 	defer cancel()
 	x.Check(c.Alter(ctx, &api.Operation{
@@ -175,8 +183,7 @@ func setup(c *client.Dgraph, sentences []string) []string {
 	txn := c.NewTxn()
 	defer txn.Discard(ctx)
 	assigned, err := txn.Mutate(ctx, &api.Mutation{
-		IgnoreIndexConflict: true,
-		SetNquads:           []byte(rdfs),
+		SetNquads: []byte(rdfs),
 	})
 	x.Check(err)
 	x.Check(txn.Commit(ctx))
@@ -188,7 +195,7 @@ func setup(c *client.Dgraph, sentences []string) []string {
 	return uids
 }
 
-func swapSentences(c *client.Dgraph, node1, node2 string) {
+func swapSentences(c *dgo.Dgraph, node1, node2 string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 	defer cancel()
 
@@ -229,8 +236,7 @@ func swapSentences(c *client.Dgraph, node1, node2 string) {
 		node2, *decode.Node2[0].Sentence,
 	)
 	if _, err := txn.Mutate(ctx, &api.Mutation{
-		IgnoreIndexConflict: true,
-		DelNquads:           []byte(delRDFs),
+		DelNquads: []byte(delRDFs),
 	}); err != nil {
 		atomic.AddUint64(&failCount, 1)
 		return
@@ -244,8 +250,7 @@ func swapSentences(c *client.Dgraph, node1, node2 string) {
 		node1, node2,
 	)
 	if _, err := txn.Mutate(ctx, &api.Mutation{
-		IgnoreIndexConflict: true,
-		SetNquads:           []byte(garbageRDFs),
+		SetNquads: []byte(garbageRDFs),
 	}); err != nil {
 		atomic.AddUint64(&failCount, 1)
 		return
@@ -260,8 +265,7 @@ func swapSentences(c *client.Dgraph, node1, node2 string) {
 		node2, *decode.Node1[0].Sentence,
 	)
 	if _, err := txn.Mutate(ctx, &api.Mutation{
-		IgnoreIndexConflict: true,
-		SetNquads:           []byte(rdfs),
+		SetNquads: []byte(rdfs),
 	}); err != nil {
 		atomic.AddUint64(&failCount, 1)
 		return
@@ -273,7 +277,7 @@ func swapSentences(c *client.Dgraph, node1, node2 string) {
 	atomic.AddUint64(&successCount, 1)
 }
 
-func checkInvariants(c *client.Dgraph, uids []string, sentences []string) error {
+func checkInvariants(c *dgo.Dgraph, uids []string, sentences []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 	defer cancel()
 

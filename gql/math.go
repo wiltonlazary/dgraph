@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package gql
@@ -25,6 +24,7 @@ import (
 	"github.com/dgraph-io/dgraph/lex"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 type mathTreeStack struct{ a []*MathTree }
@@ -42,7 +42,7 @@ func (s *mathTreeStack) popAssert() *MathTree {
 
 func (s *mathTreeStack) pop() (*MathTree, error) {
 	if s.empty() {
-		return nil, x.Errorf("Empty stack")
+		return nil, errors.Errorf("Empty stack")
 	}
 	last := s.a[len(s.a)-1]
 	s.a = s.a[:len(s.a)-1]
@@ -75,22 +75,47 @@ func isTernary(f string) bool {
 	return f == "cond"
 }
 
+func isZero(f string, rval types.Val) bool {
+	if rval.Tid != types.FloatID {
+		return false
+	}
+	g, ok := rval.Value.(float64)
+	if !ok {
+		return false
+	}
+	switch f {
+	case "floor":
+		return g >= 0 && g < 1.0
+	case "/", "%", "ceil", "sqrt", "u-":
+		return g == 0
+	case "ln":
+		return g == 1
+	}
+	return false
+}
+
 func evalMathStack(opStack, valueStack *mathTreeStack) error {
 	topOp, err := opStack.pop()
 	if err != nil {
-		return x.Errorf("Invalid Math expression")
+		return errors.Errorf("Invalid Math expression")
 	}
 	if isUnary(topOp.Fn) {
 		// Since "not" is a unary operator, just pop one value.
 		topVal, err := valueStack.pop()
 		if err != nil {
-			return x.Errorf("Invalid math statement. Expected 1 operands")
+			return errors.Errorf("Invalid math statement. Expected 1 operands")
+		}
+		if opStack.size() > 1 {
+			peek := opStack.peek().Fn
+			if (peek == "/" || peek == "%") && isZero(topOp.Fn, topVal.Const) {
+				return errors.Errorf("Division by zero")
+			}
 		}
 		topOp.Child = []*MathTree{topVal}
 
 	} else if isTernary(topOp.Fn) {
 		if valueStack.size() < 3 {
-			return x.Errorf("Invalid Math expression. Expected 3 operands")
+			return errors.Errorf("Invalid Math expression. Expected 3 operands")
 		}
 		topVal1 := valueStack.popAssert()
 		topVal2 := valueStack.popAssert()
@@ -99,7 +124,10 @@ func evalMathStack(opStack, valueStack *mathTreeStack) error {
 
 	} else {
 		if valueStack.size() < 2 {
-			return x.Errorf("Invalid Math expression. Expected 2 operands")
+			return errors.Errorf("Invalid Math expression. Expected 2 operands")
+		}
+		if isZero(topOp.Fn, valueStack.peek().Const) {
+			return errors.Errorf("Division by zero.")
 		}
 		topVal1 := valueStack.popAssert()
 		topVal2 := valueStack.popAssert()
@@ -127,7 +155,7 @@ func parseMathFunc(it *lex.ItemIterator, again bool) (*MathTree, bool, error) {
 		it.Next()
 		item := it.Item()
 		if item.Typ != itemLeftRound {
-			return nil, false, x.Errorf("Expected ( after math")
+			return nil, false, errors.Errorf("Expected ( after math")
 		}
 	}
 
@@ -189,7 +217,7 @@ func parseMathFunc(it *lex.ItemIterator, again bool) (*MathTree, bool, error) {
 			if peekIt[0].Typ == itemLeftRound {
 				again := false
 				if !isMathFunc(item.Val) {
-					return nil, false, x.Errorf("Unknown math function: %v", item.Val)
+					return nil, false, errors.Errorf("Unknown math function: %v", item.Val)
 				}
 				var child *MathTree
 				for {
@@ -232,13 +260,13 @@ func parseMathFunc(it *lex.ItemIterator, again bool) (*MathTree, bool, error) {
 			}
 			_, err := opStack.pop() // Pop away the (.
 			if err != nil {
-				return nil, false, x.Errorf("Invalid Math expression")
+				return nil, false, errors.Errorf("Invalid Math expression")
 			}
 			if !opStack.empty() {
-				return nil, false, x.Errorf("Invalid math expression.")
+				return nil, false, errors.Errorf("Invalid math expression.")
 			}
 			if valueStack.size() != 1 {
-				return nil, false, x.Errorf("Expected one item in value stack, but got %d",
+				return nil, false, errors.Errorf("Expected one item in value stack, but got %d",
 					valueStack.size())
 			}
 			res, err := valueStack.pop()
@@ -259,14 +287,14 @@ func parseMathFunc(it *lex.ItemIterator, again bool) (*MathTree, bool, error) {
 			}
 			_, err := opStack.pop() // Pop away the (.
 			if err != nil {
-				return nil, false, x.Errorf("Invalid Math expression")
+				return nil, false, errors.Errorf("Invalid Math expression")
 			}
 			if opStack.empty() {
 				// The parentheses are balanced out. Let's break.
 				break
 			}
 		} else {
-			return nil, false, x.Errorf("Unexpected item while parsing math expression: %v", item)
+			return nil, false, errors.Errorf("Unexpected item while parsing math expression: %v", item)
 		}
 	}
 
@@ -280,11 +308,11 @@ func parseMathFunc(it *lex.ItemIterator, again bool) (*MathTree, bool, error) {
 	if valueStack.empty() {
 		// This happens when we have math(). We can either return an error or
 		// ignore. Currently, let's just ignore and pretend there is no expression.
-		return nil, false, x.Errorf("Empty () not allowed in math block.")
+		return nil, false, errors.Errorf("Empty () not allowed in math block.")
 	}
 
 	if valueStack.size() != 1 {
-		return nil, false, x.Errorf("Expected one item in value stack, but got %d",
+		return nil, false, errors.Errorf("Expected one item in value stack, but got %d",
 			valueStack.size())
 	}
 	res, err := valueStack.pop()

@@ -1,73 +1,79 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
+
 package edgraph
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
-	"math/rand"
+	"math"
 	"os"
-	"strconv"
+	"sort"
 	"strings"
-	"sync"
 	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	"golang.org/x/net/context"
-	"golang.org/x/net/trace"
+	"unicode"
 
 	"github.com/dgraph-io/badger"
 	"github.com/dgraph-io/badger/options"
+	"github.com/dgraph-io/dgo/protos/api"
+	"github.com/dgraph-io/dgo/y"
+
+	nqjson "github.com/dgraph-io/dgraph/chunker/json"
+	"github.com/dgraph-io/dgraph/chunker/rdf"
 	"github.com/dgraph-io/dgraph/gql"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/posting"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/query"
-	"github.com/dgraph-io/dgraph/rdf"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/types/facets"
 	"github.com/dgraph-io/dgraph/worker"
 	"github.com/dgraph-io/dgraph/x"
-	"github.com/dgraph-io/dgraph/y"
+	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	geom "github.com/twpayne/go-geom"
-	"github.com/twpayne/go-geom/encoding/geojson"
+	"golang.org/x/net/context"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+
+	ostats "go.opencensus.io/stats"
+	"go.opencensus.io/tag"
+	otrace "go.opencensus.io/trace"
+)
+
+const (
+	methodMutate = "Server.Mutate"
+	methodQuery  = "Server.Query"
 )
 
 type ServerState struct {
 	FinishCh   chan struct{} // channel to wait for all pending reqs to finish.
 	ShutdownCh chan struct{} // channel to signal shutdown.
 
-	Pstore   *badger.ManagedDB
-	WALstore *badger.ManagedDB
+	Pstore   *badger.DB
+	WALstore *badger.DB
 
 	vlogTicker          *time.Ticker // runs every 1m, check size of vlog and run GC conditionally.
 	mandatoryVlogTicker *time.Ticker // runs every 10m, we always run vlog GC.
 
-	mu     sync.Mutex
-	needTs []chan uint64
-	notify chan struct{}
+	needTs chan tsReq
 }
 
-// TODO(tzdybal) - remove global
 var State ServerState
 
 func InitServerState() {
@@ -75,17 +81,26 @@ func InitServerState() {
 
 	State.FinishCh = make(chan struct{})
 	State.ShutdownCh = make(chan struct{})
-	State.notify = make(chan struct{}, 1)
+	State.needTs = make(chan tsReq, 100)
 
 	State.initStorage()
 
 	go State.fillTimestampRequests()
 }
 
-func (s *ServerState) runVlogGC(store *badger.ManagedDB) {
+func (s *ServerState) runVlogGC(store *badger.DB) {
 	// Get initial size on start.
 	_, lastVlogSize := store.Size()
 	const GB = int64(1 << 30)
+
+	runGC := func() {
+		var err error
+		for err == nil {
+			// If a GC is successful, immediately run it again.
+			err = store.RunValueLogGC(0.7)
+		}
+		_, lastVlogSize = store.Size()
+	}
 
 	for {
 		select {
@@ -94,229 +109,412 @@ func (s *ServerState) runVlogGC(store *badger.ManagedDB) {
 			if currentVlogSize < lastVlogSize+GB {
 				continue
 			}
-
-			// If size increased by 3.5 GB, then we run this 3 times.
-			numTimes := (currentVlogSize - lastVlogSize) / GB
-			for i := 0; i < int(numTimes); i++ {
-				store.RunValueLogGC(0.5)
-			}
-			_, lastVlogSize = store.Size()
-
+			runGC()
 		case <-s.mandatoryVlogTicker.C:
-			store.RunValueLogGC(0.5)
+			runGC()
 		}
 	}
 }
 
-func (s *ServerState) initStorage() {
-	// Write Ahead Log directory
-	x.Checkf(os.MkdirAll(Config.WALDir, 0700), "Error while creating WAL dir.")
-	kvOpt := badger.DefaultOptions
-	kvOpt.SyncWrites = true
-	kvOpt.Dir = Config.WALDir
-	kvOpt.ValueDir = Config.WALDir
-	kvOpt.TableLoadingMode = options.MemoryMap
+func setBadgerOptions(opt badger.Options, dir string) badger.Options {
+	opt.SyncWrites = false
+	opt.Truncate = true
+	opt.Dir = dir
+	opt.ValueDir = dir
+	opt.Logger = &x.ToGlog{}
 
-	var err error
-	s.WALstore, err = badger.OpenManaged(kvOpt)
-	x.Checkf(err, "Error while creating badger KV WAL store")
-
-	// Postings directory
-	// All the writes to posting store should be synchronous. We use batched writers
-	// for posting lists, so the cost of sync writes is amortized.
-	x.Check(os.MkdirAll(Config.PostingDir, 0700))
-	opt := badger.DefaultOptions
-	opt.SyncWrites = true
-	opt.Dir = Config.PostingDir
-	opt.ValueDir = Config.PostingDir
-	switch Config.PostingTables {
-	case "memorymap":
+	glog.Infof("Setting Badger table load option: %s", Config.BadgerTables)
+	switch Config.BadgerTables {
+	case "mmap":
 		opt.TableLoadingMode = options.MemoryMap
-	case "loadtoram":
+	case "ram":
 		opt.TableLoadingMode = options.LoadToRAM
-	case "fileio":
+	case "disk":
 		opt.TableLoadingMode = options.FileIO
 	default:
-		x.Fatalf("Invalid Posting Tables options")
+		x.Fatalf("Invalid Badger Tables options")
 	}
-	s.Pstore, err = badger.OpenManaged(opt)
-	x.Checkf(err, "Error while creating badger KV posting store")
+
+	glog.Infof("Setting Badger value log load option: %s", Config.BadgerVlog)
+	switch Config.BadgerVlog {
+	case "mmap":
+		opt.ValueLogLoadingMode = options.MemoryMap
+	case "disk":
+		opt.ValueLogLoadingMode = options.FileIO
+	default:
+		x.Fatalf("Invalid Badger Value log options")
+	}
+	return opt
+}
+
+func (s *ServerState) initStorage() {
+	var err error
+	{
+		// Write Ahead Log directory
+		x.Checkf(os.MkdirAll(Config.WALDir, 0700), "Error while creating WAL dir.")
+		opt := badger.LSMOnlyOptions
+		opt = setBadgerOptions(opt, Config.WALDir)
+		opt.ValueLogMaxEntries = 10000 // Allow for easy space reclamation.
+
+		// We should always force load LSM tables to memory, disregarding user settings, because
+		// Raft.Advance hits the WAL many times. If the tables are not in memory, retrieval slows
+		// down way too much, causing cluster membership issues. Because of prefix compression and
+		// value separation provided by Badger, this is still better than using the memory based WAL
+		// storage provided by the Raft library.
+		opt.TableLoadingMode = options.LoadToRAM
+
+		glog.Infof("Opening write-ahead log BadgerDB with options: %+v\n", opt)
+		s.WALstore, err = badger.Open(opt)
+		x.Checkf(err, "Error while creating badger KV WAL store")
+	}
+	{
+		// Postings directory
+		// All the writes to posting store should be synchronous. We use batched writers
+		// for posting lists, so the cost of sync writes is amortized.
+		x.Check(os.MkdirAll(Config.PostingDir, 0700))
+		opt := badger.DefaultOptions
+		opt.ValueThreshold = 1 << 10 // 1KB
+		opt.NumVersionsToKeep = math.MaxInt32
+		opt = setBadgerOptions(opt, Config.PostingDir)
+
+		glog.Infof("Opening postings BadgerDB with options: %+v\n", opt)
+		s.Pstore, err = badger.OpenManaged(opt)
+		x.Checkf(err, "Error while creating badger KV posting store")
+	}
+
 	s.vlogTicker = time.NewTicker(1 * time.Minute)
 	s.mandatoryVlogTicker = time.NewTicker(10 * time.Minute)
 	go s.runVlogGC(s.Pstore)
 	go s.runVlogGC(s.WALstore)
 }
 
-func (s *ServerState) Dispose() error {
+func (s *ServerState) Dispose() {
 	if err := s.Pstore.Close(); err != nil {
-		return errors.Wrapf(err, "While closing postings store")
+		glog.Errorf("Error while closing postings store: %v", err)
 	}
 	if err := s.WALstore.Close(); err != nil {
-		return errors.Wrapf(err, "While closing WAL store")
+		glog.Errorf("Error while closing WAL store: %v", err)
 	}
 	s.vlogTicker.Stop()
 	s.mandatoryVlogTicker.Stop()
-	return nil
 }
 
 // Server implements protos.DgraphServer
 type Server struct{}
 
-// TODO(pawan) - Remove this logic from client after client doesn't have to fetch ts
-// for Commit API.
 func (s *ServerState) fillTimestampRequests() {
-	var chs []chan uint64
 	const (
 		initDelay = 10 * time.Millisecond
-		maxDelay  = 10 * time.Second
+		maxDelay  = time.Second
 	)
-	delay := initDelay
-	for range s.notify {
-	RETRY:
-		s.mu.Lock()
-		chs = append(chs, s.needTs...)
-		s.needTs = s.needTs[:0]
-		s.mu.Unlock()
 
-		if len(chs) == 0 {
-			continue
+	var reqs []tsReq
+	for {
+		// Reset variables.
+		reqs = reqs[:0]
+		delay := initDelay
+
+		req := <-s.needTs
+	slurpLoop:
+		for {
+			reqs = append(reqs, req)
+			select {
+			case req = <-s.needTs:
+			default:
+				break slurpLoop
+			}
 		}
-		num := &intern.Num{Val: uint64(len(chs))}
+
+		// Generate the request.
+		num := &pb.Num{}
+		for _, r := range reqs {
+			if r.readOnly {
+				num.ReadOnly = true
+			} else {
+				num.Val++
+			}
+		}
+
+		// Execute the request with infinite retries.
+	retry:
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		ts, err := worker.Timestamps(ctx, num)
 		cancel()
 		if err != nil {
-			log.Printf("Error while retrieving timestamps: %v. Will retry...\n", err)
+			glog.Warningf("Error while retrieving timestamps: %v with delay: %v."+
+				" Will retry...\n", err, delay)
 			time.Sleep(delay)
 			delay *= 2
 			if delay > maxDelay {
 				delay = maxDelay
 			}
-			goto RETRY
+			goto retry
 		}
-		delay = initDelay
-		x.AssertTrue(ts.EndId-ts.StartId+1 == uint64(len(chs)))
-		for i, ch := range chs {
-			ch <- ts.StartId + uint64(i)
+		var offset uint64
+		for _, req := range reqs {
+			if req.readOnly {
+				req.ch <- ts.ReadOnly
+			} else {
+				req.ch <- ts.StartId + offset
+				offset++
+			}
 		}
-		chs = chs[:0]
+		x.AssertTrue(ts.StartId == 0 || ts.StartId+offset-1 == ts.EndId)
 	}
 }
 
-func (s *ServerState) getTimestamp() uint64 {
-	ch := make(chan uint64)
-	s.mu.Lock()
-	s.needTs = append(s.needTs, ch)
-	s.mu.Unlock()
+type tsReq struct {
+	readOnly bool
+	// A one-shot chan which we can send a txn timestamp upon.
+	ch chan uint64
+}
 
-	select {
-	case s.notify <- struct{}{}:
-	default:
-	}
-	return <-ch
+func (s *ServerState) getTimestamp(readOnly bool) uint64 {
+	tr := tsReq{readOnly: readOnly, ch: make(chan uint64)}
+	s.needTs <- tr
+	return <-tr.ch
 }
 
 func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, error) {
-	if op.Schema == "" && op.DropAttr == "" && !op.DropAll {
+	ctx, span := otrace.StartSpan(ctx, "Server.Alter")
+	defer span.End()
+	span.Annotatef(nil, "Alter operation: %+v", op)
+
+	// Always print out Alter operations because they are important and rare.
+	glog.Infof("Received ALTER op: %+v", op)
+
+	// The following code block checks if the operation should run or not.
+	if op.Schema == "" && op.DropAttr == "" && !op.DropAll && op.DropOp == api.Operation_NONE {
 		// Must have at least one field set. This helps users if they attempt
 		// to set a field but use the wrong name (could be decoded from JSON).
-		return nil, x.Errorf("Operation must have at least one field set")
+		return nil, errors.Errorf("Operation must have at least one field set")
 	}
-
 	empty := &api.Payload{}
 	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Request rejected %v", err)
-		}
 		return empty, err
+	}
+
+	if isDropAll(op) && op.DropOp == api.Operation_DATA {
+		return nil, errors.Errorf("Only one of DropAll and DropData can be true")
 	}
 
 	if !isMutationAllowed(ctx) {
-		return nil, x.Errorf("No mutations allowed.")
+		return nil, errors.Errorf("No mutations allowed by server.")
+	}
+	if err := isAlterAllowed(ctx); err != nil {
+		glog.Warningf("Alter denied with error: %v\n", err)
+		return nil, err
 	}
 
-	if op.DropAll {
-		m := intern.Mutations{DropAll: true}
-		_, err := query.ApplyMutations(ctx, &m)
+	if err := authorizeAlter(ctx, op); err != nil {
+		glog.Warningf("Alter denied with error: %v\n", err)
+		return nil, err
+	}
+
+	defer glog.Infof("ALTER op: %+v done", op)
+
+	// StartTs is not needed if the predicate to be dropped lies on this server but is required
+	// if it lies on some other machine. Let's get it for safety.
+	m := &pb.Mutations{StartTs: State.getTimestamp(false)}
+	if isDropAll(op) {
+		if len(op.DropValue) > 0 {
+			return empty, fmt.Errorf("If DropOp is set to ALL, DropValue must be empty")
+		}
+
+		m.DropOp = pb.Mutations_ALL
+		_, err := query.ApplyMutations(ctx, m)
+
+		// recreate the admin account after a drop all operation
+		ResetAcl()
 		return empty, err
 	}
-	if len(op.DropAttr) > 0 {
+
+	if op.DropOp == api.Operation_DATA {
+		if len(op.DropValue) > 0 {
+			return empty, fmt.Errorf("If DropOp is set to DATA, DropValue must be empty")
+		}
+
+		m.DropOp = pb.Mutations_DATA
+		_, err := query.ApplyMutations(ctx, m)
+
+		// recreate the admin account after a drop data operation
+		ResetAcl()
+		return empty, err
+	}
+
+	if len(op.DropAttr) > 0 || op.DropOp == api.Operation_ATTR {
+		if op.DropOp == api.Operation_ATTR && len(op.DropValue) == 0 {
+			return empty, fmt.Errorf("If DropOp is set to ATTR, DropValue must not be empty")
+		}
+
+		var attr string
+		if len(op.DropAttr) > 0 {
+			attr = op.DropAttr
+		} else {
+			attr = op.DropValue
+		}
+
+		// Reserved predicates cannot be dropped.
+		if x.IsReservedPredicate(attr) {
+			err := fmt.Errorf("predicate %s is reserved and is not allowed to be dropped",
+				attr)
+			return empty, err
+		}
+
 		nq := &api.NQuad{
 			Subject:     x.Star,
-			Predicate:   op.DropAttr,
-			ObjectValue: &api.Value{&api.Value_StrVal{x.Star}},
+			Predicate:   attr,
+			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: x.Star}},
 		}
-		wnq := &gql.NQuad{nq}
+		wnq := &gql.NQuad{NQuad: nq}
 		edge, err := wnq.ToDeletePredEdge()
 		if err != nil {
 			return empty, err
 		}
-		edges := []*intern.DirectedEdge{edge}
-		m := &intern.Mutations{Edges: edges}
+		edges := []*pb.DirectedEdge{edge}
+		m.Edges = edges
 		_, err = query.ApplyMutations(ctx, m)
 		return empty, err
 	}
-	updates, err := schema.Parse(op.Schema)
+
+	if op.DropOp == api.Operation_TYPE {
+		if len(op.DropValue) == 0 {
+			return empty, fmt.Errorf("If DropOp is set to TYPE, DropValue must not be empty")
+		}
+
+		m.DropOp = pb.Mutations_TYPE
+		m.DropValue = op.DropValue
+		_, err := query.ApplyMutations(ctx, m)
+		return empty, err
+	}
+
+	result, err := schema.Parse(op.Schema)
 	if err != nil {
 		return empty, err
 	}
-	fmt.Printf("Got schema: %+v\n", updates)
+
+	for _, update := range result.Schemas {
+		// Reserved predicates cannot be altered but let the update go through
+		// if the update is equal to the existing one.
+		if schema.IsReservedPredicateChanged(update.Predicate, update) {
+			err := fmt.Errorf("predicate %s is reserved and is not allowed to be modified",
+				update.Predicate)
+			return nil, err
+		}
+
+		if err := validatePredName(update.Predicate); err != nil {
+			return nil, err
+		}
+	}
+
+	glog.Infof("Got schema: %+v\n", result.Schemas)
 	// TODO: Maybe add some checks about the schema.
-	m := &intern.Mutations{Schema: updates, StartTs: State.getTimestamp()}
+	m.Schema = result.Schemas
+	m.Types = result.Types
 	_, err = query.ApplyMutations(ctx, m)
 	return empty, err
 }
 
-func (s *Server) Mutate(ctx context.Context, mu *api.Mutation) (resp *api.Assigned, err error) {
+func annotateStartTs(span *otrace.Span, ts uint64) {
+	span.Annotate([]otrace.Attribute{otrace.Int64Attribute("startTs", int64(ts))}, "")
+}
+
+func (s *Server) Mutate(ctx context.Context, mu *api.Mutation) (*api.Assigned, error) {
+	return s.doMutate(ctx, mu, true)
+}
+
+func (s *Server) doMutate(ctx context.Context, mu *api.Mutation, authorize bool) (
+	resp *api.Assigned, rerr error) {
+
+	var l query.Latency
+	l.Start = time.Now()
+	gmu, err := parseMutationObject(mu)
+	if err != nil {
+		return resp, err
+	}
+	parseEnd := time.Now()
+	l.Parsing = parseEnd.Sub(l.Start)
+
+	if authorize {
+		if err := authorizeMutation(ctx, gmu); err != nil {
+			return nil, err
+		}
+	}
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	startTime := time.Now()
+
+	ctx, span := otrace.StartSpan(ctx, methodMutate)
+	ctx = x.WithMethod(ctx, methodMutate)
+	defer func() {
+		span.End()
+		v := x.TagValueStatusOK
+		if rerr != nil {
+			v = x.TagValueStatusError
+		}
+		ctx, _ = tag.New(ctx, tag.Upsert(x.KeyStatus, v))
+		timeSpentMs := x.SinceMs(startTime)
+		ostats.Record(ctx, x.LatencyMs.M(timeSpentMs))
+	}()
+
 	resp = &api.Assigned{}
 	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Request rejected %v", err)
-		}
 		return resp, err
+	}
+	ostats.Record(ctx, x.NumMutations.M(1))
+
+	if len(mu.SetJson) > 0 {
+		span.Annotatef(nil, "Got JSON Mutation: %s", mu.SetJson)
+	} else if len(mu.SetNquads) > 0 {
+		span.Annotatef(nil, "Got NQuad Mutation: %s", mu.SetNquads)
 	}
 
 	if !isMutationAllowed(ctx) {
-		return nil, x.Errorf("No mutations allowed.")
+		return nil, errors.Errorf("No mutations allowed.")
 	}
 	if mu.StartTs == 0 {
-		mu.StartTs = State.getTimestamp()
+		mu.StartTs = State.getTimestamp(false)
 	}
+	annotateStartTs(span, mu.StartTs)
 	emptyMutation :=
 		len(mu.GetSetJson()) == 0 && len(mu.GetDeleteJson()) == 0 &&
 			len(mu.Set) == 0 && len(mu.Del) == 0 &&
 			len(mu.SetNquads) == 0 && len(mu.DelNquads) == 0
 	if emptyMutation {
-		return resp, fmt.Errorf("empty mutation")
+		span.Annotate(nil, "Empty mutation")
+		return resp, fmt.Errorf("Empty mutation")
 	}
-	if rand.Float64() < worker.Config.Tracing {
-		var tr trace.Trace
-		tr, ctx = x.NewTrace("GrpcMutate", ctx)
-		defer tr.Finish()
-	}
-	gmu, err := parseMutationObject(mu)
-	if err != nil {
-		return resp, err
-	}
+
+	defer func() {
+		l.Processing = time.Since(parseEnd)
+		resp.Latency = &api.Latency{
+			ParsingNs:    uint64(l.Parsing.Nanoseconds()),
+			ProcessingNs: uint64(l.Processing.Nanoseconds()),
+		}
+	}()
+
 	newUids, err := query.AssignUids(ctx, gmu.Set)
 	if err != nil {
 		return resp, err
 	}
-	resp.Uids = query.ConvertUidsToHex(query.StripBlankNode(newUids))
-	edges, err := query.ToInternal(gmu, newUids)
+	resp.Uids = query.UidsToHex(query.StripBlankNode(newUids))
+	edges, err := query.ToDirectedEdges(gmu, newUids)
 	if err != nil {
 		return resp, err
 	}
 
-	m := &intern.Mutations{
-		Edges:               edges,
-		StartTs:             mu.StartTs,
-		IgnoreIndexConflict: mu.IgnoreIndexConflict,
+	m := &pb.Mutations{
+		Edges:   edges,
+		StartTs: mu.StartTs,
 	}
+	span.Annotatef(nil, "Applying mutations: %+v", m)
 	resp.Context, err = query.ApplyMutations(ctx, m)
+	span.Annotatef(nil, "Txn Context: %+v. Err=%v", resp.Context, err)
 	if !mu.CommitNow {
 		if err == y.ErrConflict {
-			err = status.Errorf(codes.FailedPrecondition, err.Error())
+			err = status.Error(codes.FailedPrecondition, err.Error())
 		}
 		return resp, err
 	}
@@ -326,21 +524,23 @@ func (s *Server) Mutate(ctx context.Context, mu *api.Mutation) (resp *api.Assign
 		// ApplyMutations failed. We now want to abort the transaction,
 		// ignoring any error that might occur during the abort (the user would
 		// care more about the previous error).
-		ctxn := resp.Context
-		ctxn.Aborted = true
-		_, _ = worker.CommitOverNetwork(ctx, ctxn)
+		if resp.Context == nil {
+			resp.Context = &api.TxnContext{StartTs: mu.StartTs}
+		}
+		resp.Context.Aborted = true
+		_, _ = worker.CommitOverNetwork(ctx, resp.Context)
+
+		if err == y.ErrConflict {
+			// We have already aborted the transaction, so the error message should reflect that.
+			return resp, y.ErrAborted
+		}
 		return resp, err
 	}
-	tr, ok := trace.FromContext(ctx)
-	if ok {
-		tr.LazyPrintf("Prewrites err: %v. Attempting to commit/abort immediately.", err)
-	}
+	span.Annotatef(nil, "Prewrites err: %v. Attempting to commit/abort immediately.", err)
 	ctxn := resp.Context
 	// zero would assign the CommitTs
 	cts, err := worker.CommitOverNetwork(ctx, ctxn)
-	if ok {
-		tr.LazyPrintf("Status of commit at ts: %d: %v", ctxn.StartTs, err)
-	}
+	span.Annotatef(nil, "Status of commit at ts: %d: %v", ctxn.StartTs, err)
 	if err != nil {
 		if err == y.ErrAborted {
 			err = status.Errorf(codes.Aborted, err.Error())
@@ -354,45 +554,58 @@ func (s *Server) Mutate(ctx context.Context, mu *api.Mutation) (resp *api.Assign
 	return resp, nil
 }
 
+func (s *Server) Query(ctx context.Context, req *api.Request) (*api.Response, error) {
+	if err := authorizeQuery(ctx, req); err != nil {
+		return nil, err
+	}
+	if glog.V(3) {
+		glog.Infof("Got a query: %+v", req)
+	}
+
+	return s.doQuery(ctx, req)
+}
+
 // This method is used to execute the query and return the response to the
 // client as a protocol buffer message.
-func (s *Server) Query(ctx context.Context, req *api.Request) (resp *api.Response, err error) {
-	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Request rejected %v", err)
-		}
-		return resp, err
-	}
-
-	x.PendingQueries.Add(1)
-	x.NumQueries.Add(1)
-	defer x.PendingQueries.Add(-1)
+func (s *Server) doQuery(ctx context.Context, req *api.Request) (resp *api.Response, rerr error) {
 	if ctx.Err() != nil {
-		return resp, ctx.Err()
+		return nil, ctx.Err()
 	}
+	startTime := time.Now()
 
-	if rand.Float64() < worker.Config.Tracing {
-		var tr trace.Trace
-		tr, ctx = x.NewTrace("GrpcQuery", ctx)
-		defer tr.Finish()
-	}
-
-	resp = new(api.Response)
-	if len(req.Query) == 0 {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Empty query")
+	var measurements []ostats.Measurement
+	ctx, span := otrace.StartSpan(ctx, methodQuery)
+	ctx = x.WithMethod(ctx, methodQuery)
+	defer func() {
+		span.End()
+		v := x.TagValueStatusOK
+		if rerr != nil {
+			v = x.TagValueStatusError
 		}
-		return resp, fmt.Errorf("empty query")
+		ctx, _ = tag.New(ctx, tag.Upsert(x.KeyStatus, v))
+		timeSpentMs := x.SinceMs(startTime)
+		measurements = append(measurements, x.LatencyMs.M(timeSpentMs))
+		ostats.Record(ctx, measurements...)
+	}()
+
+	if err := x.HealthCheck(); err != nil {
+		return nil, err
 	}
 
-	if Config.DebugMode {
-		x.Printf("Received query: %+v\n", req.Query)
+	ostats.Record(ctx, x.PendingQueries.M(1), x.NumQueries.M(1))
+	defer func() {
+		measurements = append(measurements, x.PendingQueries.M(-1))
+	}()
+
+	resp = &api.Response{}
+	if len(req.Query) == 0 {
+		span.Annotate(nil, "Empty query")
+		return resp, fmt.Errorf("Empty query")
 	}
+
 	var l query.Latency
 	l.Start = time.Now()
-	if tr, ok := trace.FromContext(ctx); ok {
-		tr.LazyPrintf("Query received: %v, variables: %v", req.Query, req.Vars)
-	}
+	span.Annotatef(nil, "Query received: %v", req)
 
 	parsedReq, err := gql.Parse(gql.Request{
 		Str:       req.Query,
@@ -402,37 +615,72 @@ func (s *Server) Query(ctx context.Context, req *api.Request) (resp *api.Respons
 		return resp, err
 	}
 
-	if req.StartTs == 0 {
-		req.StartTs = State.getTimestamp()
-	}
-	resp.Txn = &api.TxnContext{
-		StartTs: req.StartTs,
-	}
-
-	var queryRequest = query.QueryRequest{
-		Latency:  &l,
-		GqlQuery: &parsedReq,
-		ReadTs:   req.StartTs,
-		LinRead:  req.LinRead,
-	}
-
-	var er query.ExecuteResult
-	if er, err = queryRequest.Process(ctx); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Error while processing query: %+v", err)
-		}
-		return resp, x.Wrap(err)
-	}
-	resp.Schema = er.SchemaNode
-
-	json, err := query.ToJson(&l, er.Subgraphs)
-	if err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Error while converting to protocol buffer: %+v", err)
-		}
+	if err = validateQuery(parsedReq.Query); err != nil {
 		return resp, err
 	}
-	resp.Json = json
+
+	var queryRequest = query.Request{
+		Latency:  &l,
+		GqlQuery: &parsedReq,
+	}
+	// Here we try our best effort to not contact Zero for a timestamp. If we succeed,
+	// then we use the max known transaction ts value (from ProcessDelta) for a read-only query.
+	// If we haven't processed any updates yet then fall back to getting TS from Zero.
+	switch {
+	case req.BestEffort:
+		span.Annotate([]otrace.Attribute{otrace.BoolAttribute("be", true)}, "")
+	case req.ReadOnly:
+		span.Annotate([]otrace.Attribute{otrace.BoolAttribute("ro", true)}, "")
+	default:
+		span.Annotate([]otrace.Attribute{otrace.BoolAttribute("no", true)}, "")
+	}
+	if req.BestEffort {
+		// Sanity: check that request is read-only too.
+		if !req.ReadOnly {
+			return resp, errors.Errorf("A best effort query must be read-only.")
+		}
+		if req.StartTs == 0 {
+			req.StartTs = posting.Oracle().MaxAssigned()
+		}
+		queryRequest.Cache = worker.NoTxnCache
+	}
+	if req.StartTs == 0 {
+		req.StartTs = State.getTimestamp(req.ReadOnly)
+	}
+	queryRequest.ReadTs = req.StartTs
+	resp.Txn = &api.TxnContext{StartTs: req.StartTs}
+	annotateStartTs(span, req.StartTs)
+
+	// Core processing happens here.
+	var er query.ExecutionResult
+	if er, err = queryRequest.Process(ctx); err != nil {
+		return resp, errors.Wrap(err, "")
+	}
+	var js []byte
+	if len(er.SchemaNode) > 0 || len(er.Types) > 0 {
+		sort.Slice(er.SchemaNode, func(i, j int) bool {
+			return er.SchemaNode[i].Predicate < er.SchemaNode[j].Predicate
+		})
+		sort.Slice(er.Types, func(i, j int) bool {
+			return er.Types[i].TypeName < er.Types[j].TypeName
+		})
+
+		respMap := make(map[string]interface{})
+		if len(er.SchemaNode) > 0 {
+			respMap["schema"] = er.SchemaNode
+		}
+		if len(er.Types) > 0 {
+			respMap["types"] = formatTypes(er.Types)
+		}
+		js, err = json.Marshal(respMap)
+	} else {
+		js, err = query.ToJson(&l, er.Subgraphs)
+	}
+	if err != nil {
+		return resp, err
+	}
+	resp.Json = js
+	span.Annotatef(nil, "Response = %s", js)
 
 	gl := &api.Latency{
 		ParsingNs:    uint64(l.Parsing.Nanoseconds()),
@@ -441,35 +689,37 @@ func (s *Server) Query(ctx context.Context, req *api.Request) (resp *api.Respons
 	}
 
 	resp.Latency = gl
-	resp.Txn.LinRead = queryRequest.LinRead
 	return resp, err
 }
 
-func (s *Server) CommitOrAbort(ctx context.Context, tc *api.TxnContext) (*api.TxnContext,
-	error) {
+func (s *Server) CommitOrAbort(ctx context.Context, tc *api.TxnContext) (*api.TxnContext, error) {
+	ctx, span := otrace.StartSpan(ctx, "Server.CommitOrAbort")
+	defer span.End()
+
 	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Request rejected %v", err)
-		}
 		return &api.TxnContext{}, err
 	}
 
 	tctx := &api.TxnContext{}
+	if tc.StartTs == 0 {
+		return &api.TxnContext{}, fmt.Errorf(
+			"StartTs cannot be zero while committing a transaction")
+	}
+	annotateStartTs(span, tc.StartTs)
 
+	span.Annotatef(nil, "Txn Context received: %+v", tc)
 	commitTs, err := worker.CommitOverNetwork(ctx, tc)
 	if err == y.ErrAborted {
 		tctx.Aborted = true
 		return tctx, status.Errorf(codes.Aborted, err.Error())
 	}
+	tctx.StartTs = tc.StartTs
 	tctx.CommitTs = commitTs
 	return tctx, err
 }
 
 func (s *Server) CheckVersion(ctx context.Context, c *api.Check) (v *api.Version, err error) {
 	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("request rejected %v", err)
-		}
 		return v, err
 	}
 
@@ -482,7 +732,7 @@ func (s *Server) CheckVersion(ctx context.Context, c *api.Check) (v *api.Version
 // HELPER FUNCTIONS
 //-------------------------------------------------------------------------------------------------
 func isMutationAllowed(ctx context.Context) bool {
-	if !Config.Nomutations {
+	if Config.MutationsMode != DisallowMutations {
 		return true
 	}
 	shareAllowed, ok := ctx.Value("_share_").(bool)
@@ -492,340 +742,33 @@ func isMutationAllowed(ctx context.Context) bool {
 	return true
 }
 
-func parseFacets(m map[string]interface{}, prefix string) ([]*api.Facet, error) {
-	// This happens at root.
-	if prefix == "" {
-		return nil, nil
+var errNoAuth = errors.Errorf("No Auth Token found. Token needed for Alter operations.")
+
+func isAlterAllowed(ctx context.Context) error {
+	p, ok := peer.FromContext(ctx)
+	if ok {
+		glog.Infof("Got Alter request from %q\n", p.Addr)
 	}
-
-	var facetsForPred []*api.Facet
-	var fv interface{}
-	for fname, facetVal := range m {
-		if facetVal == nil {
-			continue
-		}
-		if !strings.HasPrefix(fname, prefix) {
-			continue
-		}
-
-		if len(fname) <= len(prefix) {
-			return nil, x.Errorf("Facet key is invalid: %s", fname)
-		}
-		// Prefix includes colon, predicate:
-		f := &api.Facet{Key: fname[len(prefix):]}
-		switch v := facetVal.(type) {
-		case string:
-			if t, err := types.ParseTime(v); err == nil {
-				f.ValType = api.Facet_DATETIME
-				fv = t
-			} else {
-				f.ValType = api.Facet_STRING
-				fv = v
-			}
-		case float64:
-			// Could be int too, but we just store it as float.
-			fv = v
-			f.ValType = api.Facet_FLOAT
-		case bool:
-			fv = v
-			f.ValType = api.Facet_BOOL
-		default:
-			return nil, x.Errorf("Facet value for key: %s can only be string/float64/bool.",
-				fname)
-		}
-
-		// convert facet val interface{} to binary
-		tid := facets.TypeIDFor(&api.Facet{ValType: f.ValType})
-		fVal := &types.Val{Tid: types.BinaryID}
-		if err := types.Marshal(types.Val{Tid: tid, Value: fv}, fVal); err != nil {
-			return nil, err
-		}
-
-		fval, ok := fVal.Value.([]byte)
-		if !ok {
-			return nil, x.Errorf("Error while marshalling types.Val into binary.")
-		}
-		f.Value = fval
-		facetsForPred = append(facetsForPred, f)
+	if len(Config.AuthToken) == 0 {
+		return nil
 	}
-
-	return facetsForPred, nil
-}
-
-// This is the response for a map[string]interface{} i.e. a struct.
-type mapResponse struct {
-	nquads []*api.NQuad // nquads at this level including the children.
-	uid    string       // uid retrieved or allocated for the node.
-	fcts   []*api.Facet // facets on the edge connecting this node to the source if any.
-}
-
-func handleBasicType(k string, v interface{}, op int, nq *api.NQuad) error {
-	switch v.(type) {
-	case string:
-		predWithLang := strings.SplitN(k, "@", 2)
-		if len(predWithLang) == 2 && predWithLang[0] != "" {
-			nq.Predicate = predWithLang[0]
-			nq.Lang = predWithLang[1]
-		}
-
-		// Default value is considered as S P * deletion.
-		if v == "" && op == delete {
-			nq.ObjectValue = &api.Value{&api.Value_DefaultVal{x.Star}}
-			return nil
-		}
-
-		nq.ObjectValue = &api.Value{&api.Value_StrVal{v.(string)}}
-	case float64:
-		if v == 0 && op == delete {
-			nq.ObjectValue = &api.Value{&api.Value_DefaultVal{x.Star}}
-			return nil
-		}
-
-		nq.ObjectValue = &api.Value{&api.Value_DoubleVal{v.(float64)}}
-	case bool:
-		if v == false && op == delete {
-			nq.ObjectValue = &api.Value{&api.Value_DefaultVal{x.Star}}
-			return nil
-		}
-
-		nq.ObjectValue = &api.Value{&api.Value_BoolVal{v.(bool)}}
-	default:
-		return x.Errorf("Unexpected type for val for attr: %s while converting to nquad", k)
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return errNoAuth
+	}
+	tokens := md.Get("auth-token")
+	if len(tokens) == 0 {
+		return errNoAuth
+	}
+	if tokens[0] != Config.AuthToken {
+		return errors.Errorf("Provided auth token [%s] does not match. Permission denied.", tokens[0])
 	}
 	return nil
-
 }
 
-func checkForDeletion(mr *mapResponse, m map[string]interface{}, op int) {
-	// Since uid is the only key, this must be S * * deletion.
-	if op == delete && len(mr.uid) > 0 && len(m) == 1 {
-		mr.nquads = append(mr.nquads, &api.NQuad{
-			Subject:     mr.uid,
-			Predicate:   x.Star,
-			ObjectValue: &api.Value{&api.Value_DefaultVal{x.Star}},
-		})
-	}
-}
-
-func tryParseAsGeo(b []byte, nq *api.NQuad) (bool, error) {
-	var g geom.T
-	err := geojson.Unmarshal(b, &g)
-	if err == nil {
-		geo, err := types.ObjectValue(types.GeoID, g)
-		if err != nil {
-			return false, x.Errorf("Couldn't convert value: %s to geo type", string(b))
-		}
-
-		nq.ObjectValue = geo
-		return true, nil
-	}
-	return false, nil
-}
-
-// TODO - Abstract these parameters to a struct.
-func mapToNquads(m map[string]interface{}, idx *int, op int, parentPred string) (mapResponse, error) {
-	var mr mapResponse
-	// Check field in map.
-	if uidVal, ok := m["uid"]; ok {
-		var uid uint64
-		if id, ok := uidVal.(float64); ok {
-			uid = uint64(id)
-			// We need to check for length of id as empty string would give an error while
-			// calling ParseUint. We should assign a new uid if len == 0.
-		} else if id, ok := uidVal.(string); ok && len(id) > 0 {
-			if ok := strings.HasPrefix(id, "_:"); ok {
-				mr.uid = id
-			} else if u, err := strconv.ParseUint(id, 0, 64); err != nil {
-				return mr, err
-			} else {
-				uid = u
-			}
-		}
-
-		if uid > 0 {
-			mr.uid = fmt.Sprintf("%d", uid)
-		}
-
-	}
-
-	if len(mr.uid) == 0 {
-		if op == delete {
-			// Delete operations with a non-nil value must have a uid specified.
-			return mr, x.Errorf("uid must be present and non-zero while deleting edges.")
-		}
-
-		mr.uid = fmt.Sprintf("_:blank-%d", *idx)
-		*idx++
-	}
-
-	for pred, v := range m {
-		// We have already extracted the uid above so we skip that edge.
-		// v can be nil if user didn't set a value and if omitEmpty was not supplied as JSON
-		// option.
-		// We also skip facets here because we parse them with the corresponding predicate.
-		if pred == "uid" || strings.Index(pred, query.FacetDelimeter) > 0 {
-			continue
-		}
-
-		if op == delete {
-			// This corresponds to edge deletion.
-			if v == nil {
-				mr.nquads = append(mr.nquads, &api.NQuad{
-					Subject:     mr.uid,
-					Predicate:   pred,
-					ObjectValue: &api.Value{&api.Value_DefaultVal{x.Star}},
-				})
-				continue
-			}
-		}
-
-		prefix := pred + query.FacetDelimeter
-		// TODO - Maybe do an initial pass and build facets for all predicates. Then we don't have
-		// to call parseFacets everytime.
-		fts, err := parseFacets(m, prefix)
-		if err != nil {
-			return mr, err
-		}
-
-		nq := api.NQuad{
-			Subject:   mr.uid,
-			Predicate: pred,
-			Facets:    fts,
-		}
-
-		if v == nil {
-			if op == delete {
-				nq.ObjectValue = &api.Value{&api.Value_DefaultVal{x.Star}}
-				mr.nquads = append(mr.nquads, &nq)
-			}
-			continue
-		}
-
-		switch v.(type) {
-		case string, float64, bool:
-			if err := handleBasicType(pred, v, op, &nq); err != nil {
-				return mr, err
-			}
-			mr.nquads = append(mr.nquads, &nq)
-		case map[string]interface{}:
-			val := v.(map[string]interface{})
-			if len(val) == 0 {
-				continue
-			}
-
-			// Geojson geometry should have type and coordinates.
-			_, hasType := val["type"]
-			_, hasCoordinates := val["coordinates"]
-			if len(val) == 2 && hasType && hasCoordinates {
-				b, err := json.Marshal(val)
-				if err != nil {
-					return mr, x.Errorf("Error while trying to parse "+
-						"value: %+v as geo val", val)
-				}
-				ok, err := tryParseAsGeo(b, &nq)
-				if err != nil {
-					return mr, err
-				}
-				if ok {
-					mr.nquads = append(mr.nquads, &nq)
-					continue
-				}
-			}
-
-			cr, err := mapToNquads(v.(map[string]interface{}), idx, op, pred)
-			if err != nil {
-				return mr, err
-			}
-
-			// Add the connecting edge beteween the entities.
-			nq.ObjectId = cr.uid
-			nq.Facets = cr.fcts
-			mr.nquads = append(mr.nquads, &nq)
-			// Add the nquads that we got for the connecting entity.
-			mr.nquads = append(mr.nquads, cr.nquads...)
-		case []interface{}:
-			for _, item := range v.([]interface{}) {
-				nq := api.NQuad{
-					Subject:   mr.uid,
-					Predicate: pred,
-				}
-
-				switch iv := item.(type) {
-				case string, float64:
-					if err := handleBasicType(pred, iv, op, &nq); err != nil {
-						return mr, err
-					}
-					mr.nquads = append(mr.nquads, &nq)
-				case map[string]interface{}:
-					cr, err := mapToNquads(iv, idx, op, pred)
-					if err != nil {
-						return mr, err
-					}
-					nq.ObjectId = cr.uid
-					nq.Facets = cr.fcts
-					mr.nquads = append(mr.nquads, &nq)
-					// Add the nquads that we got for the connecting entity.
-					mr.nquads = append(mr.nquads, cr.nquads...)
-				default:
-					return mr,
-						x.Errorf("Got unsupported type for list: %s", pred)
-				}
-			}
-		default:
-			return mr, x.Errorf("Unexpected type for val for attr: %s while converting to nquad", pred)
-		}
-	}
-
-	fts, err := parseFacets(m, parentPred+query.FacetDelimeter)
-	mr.fcts = fts
-	return mr, err
-}
-
-const (
-	set = iota
-	delete
-)
-
-func nquadsFromJson(b []byte, op int) ([]*api.NQuad, error) {
-	ms := make(map[string]interface{})
-	var list []interface{}
-	if err := json.Unmarshal(b, &ms); err != nil {
-		// Couldn't parse as map, lets try to parse it as a list.
-		if err = json.Unmarshal(b, &list); err != nil {
-			return nil, err
-		}
-	}
-
-	if len(list) == 0 && len(ms) == 0 {
-		return nil, fmt.Errorf("Couldn't parse json as a map or an array.")
-	}
-
-	var idx int
-	var nquads []*api.NQuad
-	if len(list) > 0 {
-		for _, obj := range list {
-			if _, ok := obj.(map[string]interface{}); !ok {
-				return nil, x.Errorf("Only array of map allowed at root.")
-			}
-			mr, err := mapToNquads(obj.(map[string]interface{}), &idx, op, "")
-			if err != nil {
-				return mr.nquads, err
-			}
-			checkForDeletion(&mr, obj.(map[string]interface{}), op)
-			nquads = append(nquads, mr.nquads...)
-		}
-		return nquads, nil
-	}
-
-	mr, err := mapToNquads(ms, &idx, op, "")
-	checkForDeletion(&mr, ms, op)
-	return mr.nquads, err
-}
-
-func parseNQuads(b []byte, op int) ([]*api.NQuad, error) {
+func parseNQuads(b []byte) ([]*api.NQuad, error) {
 	var nqs []*api.NQuad
 	for _, line := range bytes.Split(b, []byte{'\n'}) {
-		line = bytes.TrimSpace(line)
 		nq, err := rdf.Parse(string(line))
 		if err == rdf.ErrEmpty {
 			continue
@@ -838,60 +781,216 @@ func parseNQuads(b []byte, op int) ([]*api.NQuad, error) {
 	return nqs, nil
 }
 
+// parseMutationObject tries to consolidate fields of the api.Mutation into the
+// corresponding field of the returned gql.Mutation. For example, the 3 fields,
+// api.Mutation#SetJson, api.Mutation#SetNquads and api.Mutation#Set are consolidated into the
+// gql.Mutation.Set field. Similarly the 3 fields api.Mutation#DeleteJson, api.Mutation#DelNquads
+// and api.Mutation#Del are merged into the gql.Mutation#Del field.
 func parseMutationObject(mu *api.Mutation) (*gql.Mutation, error) {
 	res := &gql.Mutation{}
 	if len(mu.SetJson) > 0 {
-		nqs, err := nquadsFromJson(mu.SetJson, set)
+		nqs, err := nqjson.Parse(mu.SetJson, nqjson.SetNquads)
 		if err != nil {
 			return nil, err
 		}
 		res.Set = append(res.Set, nqs...)
 	}
 	if len(mu.DeleteJson) > 0 {
-		nqs, err := nquadsFromJson(mu.DeleteJson, delete)
+		nqs, err := nqjson.Parse(mu.DeleteJson, nqjson.DeleteNquads)
 		if err != nil {
 			return nil, err
 		}
 		res.Del = append(res.Del, nqs...)
 	}
 	if len(mu.SetNquads) > 0 {
-		nqs, err := parseNQuads(mu.SetNquads, set)
+		nqs, err := parseNQuads(mu.SetNquads)
 		if err != nil {
 			return nil, err
 		}
 		res.Set = append(res.Set, nqs...)
 	}
 	if len(mu.DelNquads) > 0 {
-		nqs, err := parseNQuads(mu.DelNquads, delete)
+		nqs, err := parseNQuads(mu.DelNquads)
 		if err != nil {
 			return nil, err
 		}
 		res.Del = append(res.Del, nqs...)
 	}
+
 	res.Set = append(res.Set, mu.Set...)
 	res.Del = append(res.Del, mu.Del...)
+	// parse facets and convert to the binary format so that
+	// a field of type datetime like "2017-01-01" can be correctly encoded in the
+	// marshaled binary format as done in the time.Marshal method
+	if err := validateAndConvertFacets(res.Set); err != nil {
+		return nil, err
+	}
 
-	return res, validWildcards(res.Set, res.Del)
+	if err := validateNQuads(res.Set, res.Del); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
-func validWildcards(set, del []*api.NQuad) error {
+func validateAndConvertFacets(nquads []*api.NQuad) error {
+	for _, m := range nquads {
+		encodedFacets := make([]*api.Facet, 0, len(m.Facets))
+		for _, f := range m.Facets {
+			// try to interpret the value as binary first
+			if _, err := facets.ValFor(f); err == nil {
+				encodedFacets = append(encodedFacets, f)
+			} else {
+				encodedFacet, err := facets.FacetFor(f.Key, string(f.Value))
+				if err != nil {
+					return err
+				}
+				encodedFacets = append(encodedFacets, encodedFacet)
+			}
+		}
+
+		m.Facets = encodedFacets
+	}
+	return nil
+}
+
+func validateNQuads(set, del []*api.NQuad) error {
 	for _, nq := range set {
+		if err := validatePredName(nq.Predicate); err != nil {
+			return err
+		}
 		var ostar bool
 		if o, ok := nq.ObjectValue.GetVal().(*api.Value_DefaultVal); ok {
 			ostar = o.DefaultVal == x.Star
 		}
 		if nq.Subject == x.Star || nq.Predicate == x.Star || ostar {
-			return x.Errorf("Cannot use star in set n-quad: %+v", nq)
+			return errors.Errorf("Cannot use star in set n-quad: %+v", nq)
+		}
+		if err := validateKeys(nq); err != nil {
+			return errors.Wrapf(err, "key error: %+v", nq)
 		}
 	}
 	for _, nq := range del {
+		if err := validatePredName(nq.Predicate); err != nil {
+			return err
+		}
 		var ostar bool
 		if o, ok := nq.ObjectValue.GetVal().(*api.Value_DefaultVal); ok {
 			ostar = o.DefaultVal == x.Star
 		}
 		if nq.Subject == x.Star || (nq.Predicate == x.Star && !ostar) {
-			return x.Errorf("Only valid wildcard delete patterns are 'S * *' and 'S P *': %v", nq)
+			return errors.Errorf("Only valid wildcard delete patterns are 'S * *' and 'S P *': %v", nq)
+		}
+		// NOTE: we dont validateKeys() with delete to let users fix existing mistakes
+		// with bad predicate forms. ex: foo@bar ~something
+	}
+	return nil
+}
+
+func validateKey(key string) error {
+	switch {
+	case len(key) == 0:
+		return errors.Errorf("Has zero length")
+	case strings.ContainsAny(key, "~@"):
+		return errors.Errorf("Has invalid characters")
+	case strings.IndexFunc(key, unicode.IsSpace) != -1:
+		return errors.Errorf("Must not contain spaces")
+	}
+	return nil
+}
+
+// validateKeys checks predicate and facet keys in N-Quad for syntax errors.
+func validateKeys(nq *api.NQuad) error {
+	if err := validateKey(nq.Predicate); err != nil {
+		return errors.Wrapf(err, "predicate %q", nq.Predicate)
+	}
+	for i := range nq.Facets {
+		if nq.Facets[i] == nil {
+			continue
+		}
+		if err := validateKey(nq.Facets[i].Key); err != nil {
+			return errors.Errorf("Facet %q, %s", nq.Facets[i].Key, err)
 		}
 	}
 	return nil
+}
+
+// validateQuery verifies that the query does not contain any preds that
+// are longer than the limit (2^16).
+func validateQuery(queries []*gql.GraphQuery) error {
+	for _, q := range queries {
+		if err := validatePredName(q.Attr); err != nil {
+			return err
+		}
+
+		if err := validateQuery(q.Children); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validatePredName(name string) error {
+	if len(name) > math.MaxUint16 {
+		return fmt.Errorf("Predicate name length cannot be bigger than 2^16. Predicate: %v",
+			name[:80])
+	}
+	return nil
+}
+
+// formatField takes a SchemaUpdate representing a field in a type and converts
+// it into a map containing keys for the type name and the type.
+func formatField(field *pb.SchemaUpdate) map[string]string {
+	fieldMap := make(map[string]string)
+	fieldMap["name"] = field.Predicate
+	typ := ""
+	if field.List {
+		typ += "["
+	}
+
+	if field.ValueType == pb.Posting_OBJECT {
+		typ += field.ObjectTypeName
+	} else {
+		typeId := types.TypeID(field.ValueType)
+		typ += typeId.Name()
+	}
+
+	if field.NonNullable {
+		typ += "!"
+	}
+	if field.List {
+		typ += "]"
+	}
+	if field.NonNullableList {
+		typ += "!"
+	}
+	fieldMap["type"] = typ
+
+	return fieldMap
+}
+
+// formatTypes takes a list of TypeUpdates and converts them in to a list of
+// maps in a format that is human-readable to be marshaled into JSON.
+func formatTypes(types []*pb.TypeUpdate) []map[string]interface{} {
+	var res []map[string]interface{}
+	for _, typ := range types {
+		typeMap := make(map[string]interface{})
+		typeMap["name"] = typ.TypeName
+		typeMap["fields"] = make([]map[string]string, 0)
+
+		for _, field := range typ.Fields {
+			fieldMap := formatField(field)
+			typeMap["fields"] = append(typeMap["fields"].([]map[string]string), fieldMap)
+		}
+
+		res = append(res, typeMap)
+	}
+	return res
+}
+
+func isDropAll(op *api.Operation) bool {
+	if op.DropAll || op.DropOp == api.Operation_ALL {
+		return true
+	}
+	return false
 }

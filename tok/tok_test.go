@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package tok
@@ -67,7 +66,7 @@ func TestFullTextTokenizer(t *testing.T) {
 	require.True(t, has)
 	require.NotNil(t, tokenizer)
 
-	tokens, err := BuildTokens("Stemming works!", tokenizer)
+	tokens, err := BuildTokens("Stemming works!", GetLangTokenizer(tokenizer, "en"))
 	require.Nil(t, err)
 	require.Equal(t, 2, len(tokens))
 	id := tokenizer.Identifier()
@@ -131,16 +130,16 @@ func TestDateTimeTokenizer(t *testing.T) {
 }
 
 func TestFullTextTokenizerLang(t *testing.T) {
-	tokenizer, has := GetTokenizer(FtsTokenizerName("de"))
+	tokenizer, has := GetTokenizer("fulltext")
 	require.True(t, has)
 	require.NotNil(t, tokenizer)
 
-	tokens, err := BuildTokens("Katzen und Auffassung", tokenizer)
+	tokens, err := BuildTokens("Katzen und Auffassung und Auffassung", GetLangTokenizer(tokenizer, "de"))
 	require.NoError(t, err)
 	require.Equal(t, 2, len(tokens))
 	id := tokenizer.Identifier()
 	// tokens should be sorted and unique
-	require.Equal(t, []string{encodeToken("auffass", id), encodeToken("katz", id)}, tokens)
+	require.Equal(t, []string{encodeToken("auffassung", id), encodeToken("katz", id)}, tokens)
 }
 
 func TestTermTokenizer(t *testing.T) {
@@ -148,7 +147,7 @@ func TestTermTokenizer(t *testing.T) {
 	require.True(t, has)
 	require.NotNil(t, tokenizer)
 
-	tokens, err := BuildTokens("Tokenizer works!", tokenizer)
+	tokens, err := BuildTokens("Tokenizer works works!", tokenizer)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(tokens))
 	id := tokenizer.Identifier()
@@ -180,31 +179,32 @@ func TestTrigramTokenizer(t *testing.T) {
 	require.Equal(t, expected, tokens)
 }
 
-func TestGetBleveTokens(t *testing.T) {
+func TestGetFullTextTokens(t *testing.T) {
 	val := "Our chief weapon is surprise...surprise and fear...fear and surprise...." +
 		"Our two weapons are fear and surprise...and ruthless efficiency.... " +
 		"Our three weapons are fear, surprise, and ruthless efficiency..."
-	tokens, err := getBleveTokens(FTSTokenizerName, val)
+	tokens, err := (&FullTextTokenizer{lang: "en"}).Tokens(val)
 	require.NoError(t, err)
 
-	expected := []string{"chief", "weapon", "surpris", "fear", "ruthless", "effici"}
+	expected := []string{"chief", "weapon", "surpris", "fear", "ruthless", "effici", "two", "three"}
 	sort.Strings(expected)
 
 	// ensure that tokens are sorted and unique
 	require.Equal(t, expected, tokens)
 }
 
-func TestGetTextTokens1(t *testing.T) {
-	tokens, err := GetTextTokens([]string{"Quick brown fox"}, "en")
+func TestGetFullTextTokens1(t *testing.T) {
+	tokens, err := GetFullTextTokens([]string{"Quick brown fox"}, "en")
 	require.NoError(t, err)
 	require.NotNil(t, tokens)
 	require.Equal(t, 3, len(tokens))
 }
 
-func TestGetTextTokensInvalidLang(t *testing.T) {
-	tokens, err := GetTextTokens([]string{"Quick brown fox"}, "no_such_language")
-	require.Error(t, err)
-	require.Nil(t, tokens)
+func TestGetFullTextTokensInvalidLang(t *testing.T) {
+	tokens, err := GetFullTextTokens([]string{"Quick brown fox"}, "xxx_such_language")
+	require.NoError(t, err)
+	require.NotNil(t, tokens)
+	require.Equal(t, 3, len(tokens))
 }
 
 // NOTE: The Chinese/Japanese/Korean tests were are based on assuming that the
@@ -212,11 +212,11 @@ func TestGetTextTokensInvalidLang(t *testing.T) {
 // Google translate.
 
 func TestFullTextTokenizerCJKChinese(t *testing.T) {
-	tokenizer, has := GetTokenizer(FtsTokenizerName("zh"))
+	tokenizer, has := GetTokenizer("fulltext")
 	require.True(t, has)
 	require.NotNil(t, tokenizer)
 
-	got, err := BuildTokens("他是一个薪水很高的商人", tokenizer)
+	got, err := BuildTokens("他是一个薪水很高的商人", GetLangTokenizer(tokenizer, "zh"))
 	require.NoError(t, err)
 
 	id := tokenizer.Identifier()
@@ -237,11 +237,11 @@ func TestFullTextTokenizerCJKChinese(t *testing.T) {
 }
 
 func TestFullTextTokenizerCJKKorean(t *testing.T) {
-	tokenizer, has := GetTokenizer(FtsTokenizerName("ko"))
+	tokenizer, has := GetTokenizer("fulltext")
 	require.True(t, has)
 	require.NotNil(t, tokenizer)
 
-	got, err := BuildTokens("그는 큰 급여를 가진 사업가입니다.", tokenizer)
+	got, err := BuildTokens("그는 큰 급여를 가진 사업가입니다.", GetLangTokenizer(tokenizer, "ko"))
 	require.NoError(t, err)
 
 	id := tokenizer.Identifier()
@@ -257,11 +257,11 @@ func TestFullTextTokenizerCJKKorean(t *testing.T) {
 }
 
 func TestFullTextTokenizerCJKJapanese(t *testing.T) {
-	tokenizer, has := GetTokenizer(FtsTokenizerName("ja"))
+	tokenizer, has := GetTokenizer("fulltext")
 	require.True(t, has)
 	require.NotNil(t, tokenizer)
 
-	got, err := BuildTokens("彼は大きな給与を持つ実業家です", tokenizer)
+	got, err := BuildTokens("彼は大きな給与を持つ実業家です", GetLangTokenizer(tokenizer, "ja"))
 	require.NoError(t, err)
 
 	id := tokenizer.Identifier()

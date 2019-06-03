@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,15 +21,16 @@ import (
 	"sort"
 	"time"
 
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 type sortBase struct {
 	values [][]Val // Each uid could have multiple values which we need to sort it by.
 	desc   []bool  // Sort orders for different values.
-	ul     *intern.List
-	o      []*intern.Facets
+	ul     *pb.List
+	o      []*pb.Facets
 }
 
 // Len returns size of vector.
@@ -53,7 +54,7 @@ func (s byValue) Less(i, j int) bool {
 	if len(first) == 0 || len(second) == 0 {
 		return false
 	}
-	for vidx, _ := range first {
+	for vidx := range first {
 		// Null value is considered greatest hence comes at first place while doing descending sort
 		// and at last place while doing ascending sort.
 		if first[vidx].Value == nil {
@@ -79,8 +80,9 @@ func (s byValue) Less(i, j int) bool {
 	return false
 }
 
-// Sort sorts the given array in-place.
-func SortWithFacet(v [][]Val, ul *intern.List, l []*intern.Facets, desc []bool) error {
+// SortWithFacet sorts the given array in-place and considers the given facets to calculate
+// the proper ordering.
+func SortWithFacet(v [][]Val, ul *pb.List, l []*pb.Facets, desc []bool) error {
 	if len(v) == 0 || len(v[0]) == 0 {
 		return nil
 	}
@@ -90,7 +92,7 @@ func SortWithFacet(v [][]Val, ul *intern.List, l []*intern.Facets, desc []bool) 
 	case DateTimeID, IntID, FloatID, StringID, DefaultID:
 		// Don't do anything, we can sort values of this type.
 	default:
-		return fmt.Errorf("Value of type: %s isn't sortable.", typ.Name())
+		return fmt.Errorf("Value of type: %s isn't sortable", typ.Name())
 	}
 	var toBeSorted sort.Interface
 	b := sortBase{v, desc, ul, l}
@@ -100,21 +102,21 @@ func SortWithFacet(v [][]Val, ul *intern.List, l []*intern.Facets, desc []bool) 
 }
 
 // Sort sorts the given array in-place.
-func Sort(v [][]Val, ul *intern.List, desc []bool) error {
+func Sort(v [][]Val, ul *pb.List, desc []bool) error {
 	return SortWithFacet(v, ul, nil, desc)
 }
 
 // Less returns true if a is strictly less than b.
 func Less(a, b Val) (bool, error) {
 	if a.Tid != b.Tid {
-		return false, x.Errorf("Arguments of different type can not be compared.")
+		return false, errors.Errorf("Arguments of different type can not be compared.")
 	}
 	typ := a.Tid
 	switch typ {
 	case DateTimeID, UidID, IntID, FloatID, StringID, DefaultID:
 		// Don't do anything, we can sort values of this type.
 	default:
-		return false, x.Errorf("Compare not supported for type: %v", a.Tid)
+		return false, errors.Errorf("Compare not supported for type: %v", a.Tid)
 	}
 	return less(a, b), nil
 }
@@ -133,7 +135,7 @@ func less(a, b Val) bool {
 	case UidID:
 		return (a.Value.(uint64) < b.Value.(uint64))
 	case StringID, DefaultID:
-		return (a.Value.(string)) < (b.Value.(string))
+		return (a.Safe().(string)) < (b.Safe().(string))
 	}
 	return false
 }
@@ -151,23 +153,22 @@ func mismatchedLess(a, b Val) bool {
 	// point at which consecutive floats are more than 1 apart).
 	if a.Tid == FloatID {
 		return a.Value.(float64) < float64(b.Value.(int64))
-	} else {
-		x.AssertTrue(b.Tid == FloatID)
-		return float64(a.Value.(int64)) < b.Value.(float64)
 	}
+	x.AssertTrue(b.Tid == FloatID)
+	return float64(a.Value.(int64)) < b.Value.(float64)
 }
 
 // Equal returns true if a is equal to b.
 func Equal(a, b Val) (bool, error) {
 	if a.Tid != b.Tid {
-		return false, x.Errorf("Arguments of different type can not be compared.")
+		return false, errors.Errorf("Arguments of different type can not be compared.")
 	}
 	typ := a.Tid
 	switch typ {
 	case DateTimeID, IntID, FloatID, StringID, DefaultID, BoolID:
 		// Don't do anything, we can sort values of this type.
 	default:
-		return false, x.Errorf("Equal not supported for type: %v", a.Tid)
+		return false, errors.Errorf("Equal not supported for type: %v", a.Tid)
 	}
 	return equal(a, b), nil
 }
@@ -178,15 +179,25 @@ func equal(a, b Val) bool {
 	}
 	switch a.Tid {
 	case DateTimeID:
-		return a.Value.(time.Time) == (b.Value.(time.Time))
+		aVal, aOk := a.Value.(time.Time)
+		bVal, bOk := b.Value.(time.Time)
+		return aOk && bOk && aVal.Equal(bVal)
 	case IntID:
-		return (a.Value.(int64)) == (b.Value.(int64))
+		aVal, aOk := a.Value.(int64)
+		bVal, bOk := b.Value.(int64)
+		return aOk && bOk && aVal == bVal
 	case FloatID:
-		return (a.Value.(float64)) == (b.Value.(float64))
+		aVal, aOk := a.Value.(float64)
+		bVal, bOk := b.Value.(float64)
+		return aOk && bOk && aVal == bVal
 	case StringID, DefaultID:
-		return (a.Value.(string)) == (b.Value.(string))
+		aVal, aOk := a.Value.(string)
+		bVal, bOk := b.Value.(string)
+		return aOk && bOk && aVal == bVal
 	case BoolID:
-		return a.Value.(bool) == (b.Value.(bool))
+		aVal, aOk := a.Value.(bool)
+		bVal, bOk := b.Value.(bool)
+		return aOk && bOk && aVal == bVal
 	}
 	return false
 }

@@ -19,10 +19,12 @@ package y
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"math"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 )
@@ -31,21 +33,37 @@ import (
 // and encountering the end of slice.
 var ErrEOF = errors.New("End of mapped region")
 
+const (
+	// Sync indicates that O_DSYNC should be set on the underlying file,
+	// ensuring that data writes do not return until the data is flushed
+	// to disk.
+	Sync = 1 << iota
+	// ReadOnly opens the underlying file on a read-only basis.
+	ReadOnly
+)
+
 var (
 	// This is O_DSYNC (datasync) on platforms that support it -- see file_unix.go
 	datasyncFileFlag = 0x0
 
 	// CastagnoliCrcTable is a CRC32 polynomial table
 	CastagnoliCrcTable = crc32.MakeTable(crc32.Castagnoli)
+
+	// Dummy channel for nil closers.
+	dummyCloserChan = make(chan struct{})
 )
 
-// OpenExistingSyncedFile opens an existing file, errors if it doesn't exist.
-func OpenExistingSyncedFile(filename string, sync bool) (*os.File, error) {
-	flags := os.O_RDWR
-	if sync {
-		flags |= datasyncFileFlag
+// OpenExistingFile opens an existing file, errors if it doesn't exist.
+func OpenExistingFile(filename string, flags uint32) (*os.File, error) {
+	openFlags := os.O_RDWR
+	if flags&ReadOnly != 0 {
+		openFlags = os.O_RDONLY
 	}
-	return os.OpenFile(filename, flags, 0)
+
+	if flags&Sync != 0 {
+		openFlags |= datasyncFileFlag
+	}
+	return os.OpenFile(filename, openFlags, 0)
 }
 
 // CreateSyncedFile creates a new file (using O_EXCL), errors if it already existed.
@@ -76,7 +94,7 @@ func OpenTruncFile(filename string, sync bool) (*os.File, error) {
 }
 
 // SafeCopy does append(a[:0], src...).
-func SafeCopy(a []byte, src []byte) []byte {
+func SafeCopy(a, src []byte) []byte {
 	return append(a[:0], src...)
 }
 
@@ -107,7 +125,7 @@ func ParseTs(key []byte) uint64 {
 // is same.
 // a<timestamp> would be sorted higher than aa<timestamp> if we use bytes.compare
 // All keys should have timestamp.
-func CompareKeys(key1 []byte, key2 []byte) int {
+func CompareKeys(key1, key2 []byte) int {
 	AssertTrue(len(key1) > 8 && len(key2) > 8)
 	if cmp := bytes.Compare(key1[:len(key1)-8], key2[:len(key2)-8]); cmp != 0 {
 		return cmp
@@ -121,7 +139,7 @@ func ParseKey(key []byte) []byte {
 		return nil
 	}
 
-	AssertTruef(len(key) > 8, "key=%q", key)
+	AssertTrue(len(key) > 8)
 	return key[:len(key)-8]
 }
 
@@ -146,6 +164,19 @@ func (s *Slice) Resize(sz int) []byte {
 		s.buf = make([]byte, sz)
 	}
 	return s.buf[0:sz]
+}
+
+// FixedDuration returns a string representation of the given duration with the
+// hours, minutes, and seconds.
+func FixedDuration(d time.Duration) string {
+	str := fmt.Sprintf("%02ds", int(d.Seconds())%60)
+	if d >= time.Minute {
+		str = fmt.Sprintf("%02dm", int(d.Minutes())%60) + str
+	}
+	if d >= time.Hour {
+		str = fmt.Sprintf("%02dh", int(d.Hours())) + str
+	}
+	return str
 }
 
 // Closer holds the two things we need to close a goroutine and wait for it to finish: a chan
@@ -175,11 +206,17 @@ func (lc *Closer) Signal() {
 
 // HasBeenClosed gets signaled when Signal() is called.
 func (lc *Closer) HasBeenClosed() <-chan struct{} {
+	if lc == nil {
+		return dummyCloserChan
+	}
 	return lc.closed
 }
 
 // Done calls Done() on the WaitGroup.
 func (lc *Closer) Done() {
+	if lc == nil {
+		return
+	}
 	lc.waiting.Done()
 }
 
@@ -193,4 +230,73 @@ func (lc *Closer) Wait() {
 func (lc *Closer) SignalAndWait() {
 	lc.Signal()
 	lc.Wait()
+}
+
+// Throttle allows a limited number of workers to run at a time. It also
+// provides a mechanism to check for errors encountered by workers and wait for
+// them to finish.
+type Throttle struct {
+	once      sync.Once
+	wg        sync.WaitGroup
+	ch        chan struct{}
+	errCh     chan error
+	finishErr error
+}
+
+// NewThrottle creates a new throttle with a max number of workers.
+func NewThrottle(max int) *Throttle {
+	return &Throttle{
+		ch:    make(chan struct{}, max),
+		errCh: make(chan error, max),
+	}
+}
+
+// Do should be called by workers before they start working. It blocks if there
+// are already maximum number of workers working. If it detects an error from
+// previously Done workers, it would return it.
+func (t *Throttle) Do() error {
+	for {
+		select {
+		case t.ch <- struct{}{}:
+			t.wg.Add(1)
+			return nil
+		case err := <-t.errCh:
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// Done should be called by workers when they finish working. They can also
+// pass the error status of work done.
+func (t *Throttle) Done(err error) {
+	if err != nil {
+		t.errCh <- err
+	}
+	select {
+	case <-t.ch:
+	default:
+		panic("Throttle Do Done mismatch")
+	}
+	t.wg.Done()
+}
+
+// Finish waits until all workers have finished working. It would return any error passed by Done.
+// If Finish is called multiple time, it will wait for workers to finish only once(first time).
+// From next calls, it will return same error as found on first call.
+func (t *Throttle) Finish() error {
+	t.once.Do(func() {
+		t.wg.Wait()
+		close(t.ch)
+		close(t.errCh)
+		for err := range t.errCh {
+			if err != nil {
+				t.finishErr = err
+				return
+			}
+		}
+	})
+
+	return t.finishErr
 }

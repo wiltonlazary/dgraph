@@ -187,14 +187,14 @@ upload_assets() {
 		if [[ $BUILD_TAG == "nightly" ]]; then
 			read release_id < <( \
 				send_gh_api_data_request repos/${DGRAPH_REPO}/releases POST \
-				"{ \"name\": \"Dgraph ${DGRAPH_VERSION}${ASSET_SUFFIX}\", \"tag_name\": \"${BUILD_TAG}\", \
+				"{ \"name\": \"${DGRAPH_VERSION}${ASSET_SUFFIX}\", \"tag_name\": \"${BUILD_TAG}\", \
 				\"prerelease\": true }" \
 				| jq -r -c '.id') \
 				|| exit
 		else
 			read release_id < <( \
 				send_gh_api_data_request repos/${DGRAPH_REPO}/releases POST \
-				"{ \"name\": \"Dgraph ${DGRAPH_VERSION} Release\", \"tag_name\": \"${BUILD_TAG}\", \
+				"{ \"name\": \"${DGRAPH_VERSION}\", \"tag_name\": \"${BUILD_TAG}\", \
 				\"draft\": true }" \
 				| jq -r -c '.id') \
 				|| exit
@@ -253,7 +253,9 @@ build_docker_image() {
 	tar -xzf ${NIGHTLY_FILE} -C dgraph-build
 	echo -e "Building the docker image with tag: $DOCKER_TAG."
 	docker build -t dgraph/dgraph:$DOCKER_TAG -f $DGRAPH/contrib/nightly/Dockerfile .
-	if [[ $DOCKER_TAG == $LATEST_TAG ]]; then
+  # This script only runs on Travis for master or when a new tag is pushed. When a new tag is pushed
+  # we must tag the docker image with latest tag as well.
+  if [[ $DOCKER_TAG != "master" ]]; then
 		echo "Tagging docker image with latest tag"
 		docker tag dgraph/dgraph:$DOCKER_TAG dgraph/dgraph:latest
 	fi
@@ -266,7 +268,7 @@ upload_docker_image() {
 	echo "Pushing the image"
 	echo -e "Pushing image with tag $DOCKER_TAG"
 	docker push dgraph/dgraph:$DOCKER_TAG
-	if [[ $DOCKER_TAG == $LATEST_TAG ]]; then
+	if [[ $DOCKER_TAG != "master" ]]; then
 		echo -e "Pushing latest image"
 		docker push dgraph/dgraph:latest
 	fi

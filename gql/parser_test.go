@@ -1,29 +1,29 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2015-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package gql
 
 import (
+	"bytes"
 	"os"
 	"runtime/debug"
 	"testing"
 
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/rdf"
+	"github.com/dgraph-io/dgo/protos/api"
+	"github.com/dgraph-io/dgraph/chunker/rdf"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,7 +48,7 @@ func TestParseCountValError(t *testing.T) {
 	`
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "count of a variable is not allowed")
+	require.Contains(t, err.Error(), "Count of a variable is not allowed")
 }
 
 func TestParseVarError(t *testing.T) {
@@ -68,6 +68,59 @@ func TestParseVarError(t *testing.T) {
 	require.Contains(t, err.Error(), "Cannot do uid() of a variable")
 }
 
+func TestDuplicateQueryAliasesError(t *testing.T) {
+	query := `
+{
+  find_michael(func: eq(name@., "Michael")) {
+    uid
+    name@.
+    age
+  }
+    find_michael(func: eq(name@., "Amit")) {
+      uid
+      name@.
+    }
+}`
+	_, err := Parse(Request{Str: query})
+	require.Error(t, err)
+
+	queryInOpType := `
+{
+  find_michael(func: eq(name@., "Michael")) {
+    uid
+    name@.
+    age
+  }
+}
+query {find_michael(func: eq(name@., "Amit")) {
+      uid
+      name@.
+    }
+}
+`
+	_, err = Parse(Request{Str: queryInOpType})
+	require.Error(t, err)
+
+	queryWithDuplicateShortestPaths := `
+{
+ path as shortest(from: 0x1, to: 0x4) {
+  friend
+ }
+ path2 as shortest(from: 0x2, to: 0x3) {
+    friend
+ }
+ pathQuery1(func: uid(path)) {
+   name
+ }
+ pathQuery2(func: uid(path2)) {
+   name
+ }
+
+}`
+	_, err = Parse(Request{Str: queryWithDuplicateShortestPaths})
+	require.NoError(t, err)
+}
+
 func TestParseQueryListPred1(t *testing.T) {
 	query := `
 	{
@@ -82,32 +135,60 @@ func TestParseQueryListPred1(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestParseQueryExpandForward(t *testing.T) {
+	query := `
+	{
+		var(func: uid( 0x0a)) {
+			friends {
+				expand(_forward_)
+			}
+		}
+	}
+`
+	_, err := Parse(Request{Str: query})
+	require.NoError(t, err)
+}
+
+func TestParseQueryExpandReverse(t *testing.T) {
+	query := `
+	{
+		var(func: uid( 0x0a)) {
+			friends {
+				expand(_reverse_)
+			}
+		}
+	}
+`
+	_, err := Parse(Request{Str: query})
+	require.NoError(t, err)
+}
+
 func TestParseQueryAliasListPred(t *testing.T) {
 	query := `
 	{
 		me(func: uid(0x0a)) {
-			pred: _predicate_
+			pred: some_pred
 		}
 	}
 `
 	res, err := Parse(Request{Str: query})
 	require.NoError(t, err)
 	require.Equal(t, "pred", res.Query[0].Children[0].Alias)
-	require.Equal(t, "_predicate_", res.Query[0].Children[0].Attr)
+	require.Equal(t, "some_pred", res.Query[0].Children[0].Attr)
 }
 
 func TestParseQueryCountListPred(t *testing.T) {
 	query := `
 	{
 		me(func: uid(0x0a)) {
-			count(_predicate_)
+			count(some_pred)
 		}
 	}
 `
 	res, err := Parse(Request{Str: query})
 	require.NoError(t, err)
 	require.Equal(t, true, res.Query[0].Children[0].IsCount)
-	require.Equal(t, "_predicate_", res.Query[0].Children[0].Attr)
+	require.Equal(t, "some_pred", res.Query[0].Children[0].Attr)
 }
 
 func TestParseQueryListPred2(t *testing.T) {
@@ -118,7 +199,7 @@ func TestParseQueryListPred2(t *testing.T) {
 		}
 
 		var(func: uid(f)) {
-			l as _predicate_
+			l as some_pred
 		}
 
 		var(func: uid( 0x0a)) {
@@ -140,9 +221,9 @@ func TestParseQueryListPred_MultiVarError(t *testing.T) {
 		}
 
 		var(func: uid(f)) {
-			l as _predicate_
+			l as some_pred
 			friend {
-				g as _predicate_
+				g as some_pred
 			}
 		}
 
@@ -538,7 +619,7 @@ func TestParseQueryWithLevelAgg(t *testing.T) {
 	require.Equal(t, "a", res.Query[0].Children[0].Children[0].Var)
 	require.True(t, res.Query[0].Children[1].IsInternal)
 	require.Equal(t, "a", res.Query[0].Children[1].NeedsVar[0].Name)
-	require.Equal(t, VALUE_VAR, res.Query[0].Children[1].NeedsVar[0].Typ)
+	require.Equal(t, ValueVar, res.Query[0].Children[1].NeedsVar[0].Typ)
 	require.Equal(t, "s", res.Query[0].Children[1].Var)
 }
 
@@ -565,9 +646,9 @@ func TestParseQueryWithVarValAggCombination(t *testing.T) {
 	require.NotNil(t, res.Query)
 	require.Equal(t, 2, len(res.Query))
 	require.Equal(t, "L", res.Query[0].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[0].Typ)
 	require.Equal(t, "c", res.Query[0].NeedsVar[1].Name)
-	require.Equal(t, VALUE_VAR, res.Query[0].NeedsVar[1].Typ)
+	require.Equal(t, ValueVar, res.Query[0].NeedsVar[1].Typ)
 	require.Equal(t, "c", res.Query[0].Order[0].Attr)
 	require.Equal(t, "name", res.Query[0].Children[0].Attr)
 	require.Equal(t, "val", res.Query[0].Children[1].Attr)
@@ -603,9 +684,9 @@ func TestParseQueryWithVarValAgg(t *testing.T) {
 	require.NotNil(t, res.Query)
 	require.Equal(t, 2, len(res.Query))
 	require.Equal(t, "L", res.Query[0].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[0].Typ)
 	require.Equal(t, "n", res.Query[0].NeedsVar[1].Name)
-	require.Equal(t, VALUE_VAR, res.Query[0].NeedsVar[1].Typ)
+	require.Equal(t, ValueVar, res.Query[0].NeedsVar[1].Typ)
 	require.Equal(t, "n", res.Query[0].Order[0].Attr)
 	require.Equal(t, "name", res.Query[0].Children[0].Attr)
 	require.Equal(t, "L", res.Query[1].Children[0].Var)
@@ -673,9 +754,9 @@ func TestParseQueryWithVarValCount(t *testing.T) {
 	require.NotNil(t, res.Query)
 	require.Equal(t, 2, len(res.Query))
 	require.Equal(t, "L", res.Query[0].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[0].Typ)
 	require.Equal(t, "n", res.Query[0].NeedsVar[1].Name)
-	require.Equal(t, VALUE_VAR, res.Query[0].NeedsVar[1].Typ)
+	require.Equal(t, ValueVar, res.Query[0].NeedsVar[1].Typ)
 	require.Equal(t, "n", res.Query[0].Order[0].Attr)
 	require.Equal(t, "name", res.Query[0].Children[0].Attr)
 	require.Equal(t, "L", res.Query[1].Children[0].Var)
@@ -701,9 +782,9 @@ func TestParseQueryWithVarVal(t *testing.T) {
 	require.NotNil(t, res.Query)
 	require.Equal(t, 2, len(res.Query))
 	require.Equal(t, "L", res.Query[0].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[0].Typ)
 	require.Equal(t, "n", res.Query[0].NeedsVar[1].Name)
-	require.Equal(t, VALUE_VAR, res.Query[0].NeedsVar[1].Typ)
+	require.Equal(t, ValueVar, res.Query[0].NeedsVar[1].Typ)
 	require.Equal(t, "n", res.Query[0].Order[0].Attr)
 	require.Equal(t, "name", res.Query[0].Children[0].Attr)
 	require.Equal(t, "L", res.Query[1].Children[0].Var)
@@ -726,9 +807,9 @@ func TestParseQueryWithVarMultiRoot(t *testing.T) {
 	require.Equal(t, "L", res.Query[0].NeedsVar[0].Name)
 	require.Equal(t, "J", res.Query[0].NeedsVar[1].Name)
 	require.Equal(t, "K", res.Query[0].NeedsVar[2].Name)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[0].Typ)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[1].Typ)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[2].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[1].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[2].Typ)
 	require.Equal(t, "L", res.Query[1].Children[0].Var)
 	require.Equal(t, "J", res.Query[2].Children[0].Var)
 	require.Equal(t, "K", res.Query[3].Children[0].Var)
@@ -752,9 +833,9 @@ func TestParseQueryWithVar(t *testing.T) {
 	require.Equal(t, "L", res.Query[0].NeedsVar[0].Name)
 	require.Equal(t, "J", res.Query[1].NeedsVar[0].Name)
 	require.Equal(t, "K", res.Query[2].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[0].NeedsVar[0].Typ)
-	require.Equal(t, UID_VAR, res.Query[1].NeedsVar[0].Typ)
-	require.Equal(t, UID_VAR, res.Query[2].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[0].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[1].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[2].NeedsVar[0].Typ)
 	require.Equal(t, "L", res.Query[3].Children[0].Var)
 	require.Equal(t, "J", res.Query[4].Children[0].Var)
 	require.Equal(t, "K", res.Query[5].Children[0].Var)
@@ -847,7 +928,7 @@ func TestParseQueryWithVarAtRootFilterID(t *testing.T) {
 	require.Equal(t, "K", res.Query[0].Var)
 	require.Equal(t, "L", res.Query[0].Children[0].Var)
 	require.Equal(t, "L", res.Query[1].Filter.Func.NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[1].Filter.Func.NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[1].Filter.Func.NeedsVar[0].Typ)
 	require.Equal(t, []string{"K", "L"}, res.QueryVars[0].Defines)
 }
 
@@ -869,7 +950,7 @@ func TestParseQueryWithVarAtRoot(t *testing.T) {
 	require.Equal(t, "K", res.Query[0].Var)
 	require.Equal(t, "fr", res.Query[0].Children[0].Var)
 	require.Equal(t, "fr", res.Query[1].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[1].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[1].NeedsVar[0].Typ)
 	require.Equal(t, []string{"K", "fr"}, res.QueryVars[0].Defines)
 }
 
@@ -913,8 +994,8 @@ func TestParseQueryWithVarInIneq(t *testing.T) {
 	require.Equal(t, 2, len(res.Query))
 	require.Equal(t, "fr", res.Query[0].Children[0].Var)
 	require.Equal(t, "fr", res.Query[1].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[1].NeedsVar[0].Typ)
-	require.Equal(t, VALUE_VAR, res.Query[1].Filter.Func.NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[1].NeedsVar[0].Typ)
+	require.Equal(t, ValueVar, res.Query[1].Filter.Func.NeedsVar[0].Typ)
 	require.Equal(t, 1, len(res.Query[1].Filter.Func.Args))
 	require.Equal(t, "a", res.Query[1].Filter.Func.Attr)
 	require.Equal(t, true, res.Query[1].Filter.Func.IsValueVar)
@@ -941,7 +1022,7 @@ func TestParseQueryWithVar1(t *testing.T) {
 	require.Equal(t, 2, len(res.Query))
 	require.Equal(t, "L", res.Query[0].Children[0].Var)
 	require.Equal(t, "L", res.Query[1].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[1].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[1].NeedsVar[0].Typ)
 }
 
 func TestParseQueryWithMultipleVar(t *testing.T) {
@@ -970,8 +1051,8 @@ func TestParseQueryWithMultipleVar(t *testing.T) {
 	require.Equal(t, "B", res.Query[0].Children[0].Children[0].Var)
 	require.Equal(t, "L", res.Query[1].NeedsVar[0].Name)
 	require.Equal(t, "B", res.Query[2].NeedsVar[0].Name)
-	require.Equal(t, UID_VAR, res.Query[1].NeedsVar[0].Typ)
-	require.Equal(t, UID_VAR, res.Query[2].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[1].NeedsVar[0].Typ)
+	require.Equal(t, UidVar, res.Query[2].NeedsVar[0].Typ)
 	require.Equal(t, []string{"L", "B"}, res.QueryVars[0].Defines)
 	require.Equal(t, []string{"L"}, res.QueryVars[1].Needs)
 	require.Equal(t, []string{"B"}, res.QueryVars[2].Needs)
@@ -980,7 +1061,7 @@ func TestParseQueryWithMultipleVar(t *testing.T) {
 func TestParseShortestPath(t *testing.T) {
 	query := `
 	{
-		shortest(from:0x0a, to:0x0b, numpaths: 3) {
+		shortest(from:0x0a, to:0x0b, numpaths: 3, minweight: 3, maxweight: 6) {
 			friends
 			name
 		}
@@ -993,6 +1074,8 @@ func TestParseShortestPath(t *testing.T) {
 	require.Equal(t, "0x0a", res.Query[0].Args["from"])
 	require.Equal(t, "0x0b", res.Query[0].Args["to"])
 	require.Equal(t, "3", res.Query[0].Args["numpaths"])
+	require.Equal(t, "3", res.Query[0].Args["minweight"])
+	require.Equal(t, "6", res.Query[0].Args["maxweight"])
 }
 
 func TestParseMultipleQueries(t *testing.T) {
@@ -1148,7 +1231,8 @@ func TestParseIdListError(t *testing.T) {
 	}`
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Unexpected character [ while parsing request")
+	require.Contains(t, err.Error(),
+		"Unrecognized character in lexText: U+005D ']'")
 }
 
 func TestParseIdListError2(t *testing.T) {
@@ -1160,7 +1244,8 @@ func TestParseIdListError2(t *testing.T) {
 	}`
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Unexpected character [ while parsing request.")
+	require.Contains(t, err.Error(),
+		"Unexpected character [ while parsing request.")
 }
 
 func TestParseFirst(t *testing.T) {
@@ -1480,11 +1565,38 @@ func TestParseSchemaAndQuery(t *testing.T) {
 
 	_, err := Parse(Request{Str: query1})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "schema block is not allowed with query block")
+	require.Contains(t, err.Error(), "Schema block is not allowed with query block")
 
 	_, err = Parse(Request{Str: query2})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "schema block is not allowed with query block")
+	require.Contains(t, err.Error(), "Schema block is not allowed with query block")
+}
+
+func TestParseSchemaType(t *testing.T) {
+	query := `
+		schema (type: Person) {
+		}
+	`
+	res, err := Parse(Request{Str: query})
+	require.NoError(t, err)
+	require.Equal(t, len(res.Schema.Predicates), 0)
+	require.Equal(t, len(res.Schema.Types), 1)
+	require.Equal(t, res.Schema.Types[0], "Person")
+	require.Equal(t, len(res.Schema.Fields), 0)
+}
+
+func TestParseSchemaTypeMulti(t *testing.T) {
+	query := `
+		schema (type: [Person, Animal]) {
+		}
+	`
+	res, err := Parse(Request{Str: query})
+	require.NoError(t, err)
+	require.Equal(t, len(res.Schema.Predicates), 0)
+	require.Equal(t, len(res.Schema.Types), 2)
+	require.Equal(t, res.Schema.Types[0], "Person")
+	require.Equal(t, res.Schema.Types[1], "Animal")
+	require.Equal(t, len(res.Schema.Fields), 0)
 }
 
 func TestParseSchemaError(t *testing.T) {
@@ -1527,8 +1639,24 @@ func TestParseMutationError(t *testing.T) {
 			}
 		}
 	`
-	_, err := Parse(Request{Str: query})
+	_, err := ParseMutation(query)
 	require.Error(t, err)
+	require.Equal(t, `Expected { at the start of block. Got: [mutation]`, err.Error())
+}
+
+func TestParseMutationError2(t *testing.T) {
+	query := `
+			set {
+				<name> <is> <something> .
+				<hometown> <is> <san/francisco> .
+			}
+			delete {
+				<name> <is> <something-else> .
+			}
+	`
+	_, err := ParseMutation(query)
+	require.Error(t, err)
+	require.Equal(t, `Expected { at the start of block. Got: [set]`, err.Error())
 }
 
 func TestParseMutationAndQueryWithComments(t *testing.T) {
@@ -1758,8 +1886,7 @@ func TestParseVariablesError1(t *testing.T) {
 	`
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Variable $")
-	require.Contains(t, err.Error(), "should be initialised")
+	require.Contains(t, err.Error(), "Unrecognized character in lexText: U+0034 '4'")
 }
 
 func TestParseFilter_root(t *testing.T) {
@@ -2065,8 +2192,8 @@ func TestParseFilter_unbalancedbrac(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Unexpected item while parsing @filter")
-	require.Contains(t, err.Error(), "'{'")
+	require.Contains(t, err.Error(),
+		"Unrecognized character inside a func: U+007B '{'")
 }
 
 func TestParseFilter_Geo1(t *testing.T) {
@@ -2308,7 +2435,8 @@ func TestParseCountError1(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Multiple predicates not allowed in single count")
+	require.Contains(t, err.Error(),
+		"Unrecognized character inside a func: U+007D '}'")
 }
 
 func TestParseCountError2(t *testing.T) {
@@ -2322,7 +2450,8 @@ func TestParseCountError2(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Predicate name cannot be empty")
+	require.Contains(t, err.Error(),
+		"Unrecognized character inside a func: U+007D '}'")
 }
 
 func TestParseCheckPwd(t *testing.T) {
@@ -2470,6 +2599,22 @@ func TestLangs(t *testing.T) {
 	require.Equal(t, []string{"en", "ru", "hu"}, gq.Query[0].Children[1].Langs)
 }
 
+func TestAllLangs(t *testing.T) {
+	query := `
+	query {
+		me(func: uid(1)) {
+			name@*
+		}
+	}
+	`
+
+	gq, err := Parse(Request{Str: query})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query[0].Children))
+	require.Equal(t, "name", gq.Query[0].Children[0].Attr)
+	require.Equal(t, []string{"*"}, gq.Query[0].Children[0].Langs)
+}
+
 func TestLangsInvalid1(t *testing.T) {
 	query := `
 	query {
@@ -2523,7 +2668,8 @@ func TestLangsInvalid4(t *testing.T) {
 
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected directive or language list")
+	require.Contains(t, err.Error(),
+		"Unrecognized character in lexDirective: U+000A")
 }
 
 func TestLangsInvalid5(t *testing.T) {
@@ -2537,7 +2683,8 @@ func TestLangsInvalid5(t *testing.T) {
 
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected directive or language list")
+	require.Contains(t, err.Error(),
+		"Unrecognized character in lexDirective: U+003C '<'")
 }
 
 func TestLangsInvalid6(t *testing.T) {
@@ -2566,6 +2713,36 @@ func TestLangsInvalid7(t *testing.T) {
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Expected only one dot(.) while parsing language list.")
+}
+
+func TestLangsInvalid8(t *testing.T) {
+	query := `
+	query {
+		me(func: uid(1)) {
+			name@*:en
+		}
+	}
+	`
+
+	_, err := Parse(Request{Str: query})
+	require.Error(t, err)
+	require.Contains(t, err.Error(),
+		"If * is used, no other languages are allowed in the language list")
+}
+
+func TestLangsInvalid9(t *testing.T) {
+	query := `
+	query {
+		me(func: eqs(name@*, "Amir")) {
+			name@en
+		}
+	}
+	`
+
+	_, err := Parse(Request{Str: query})
+	require.Error(t, err)
+	require.Contains(t, err.Error(),
+		"The * symbol cannot be used as a valid language inside functions")
 }
 
 func TestLangsFilter(t *testing.T) {
@@ -2623,8 +2800,8 @@ func TestLangsFilter_error2(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected arg after func [alloftext]")
-	require.Contains(t, err.Error(), "','")
+	require.Contains(t, err.Error(),
+		"Unrecognized character in lexDirective: U+002C ','")
 }
 
 func TestLangsFunction(t *testing.T) {
@@ -2843,7 +3020,8 @@ func TestParseFacetsError1(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected ( after func name [facet1]")
+	require.Contains(t, err.Error(),
+		"Consecutive commas not allowed.")
 }
 
 func TestParseFacetsVarError(t *testing.T) {
@@ -2948,12 +3126,12 @@ func TestParseFacetsDuplicateVarError(t *testing.T) {
 func TestParseFacetsOrderVar(t *testing.T) {
 	query := `
 	query {
-		me(func: uid(0x1)) {
+		me1(func: uid(0x1)) {
 			friends @facets(orderdesc: a as b) {
 				name
 			}
 		}
-		me(func: uid(a)) { }
+		me2(func: uid(a)) { }
 	}
 `
 	_, err := Parse(Request{Str: query})
@@ -3162,7 +3340,8 @@ func TestParseFacetsFail1(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected ( after func name [key1]")
+	require.Contains(t, err.Error(),
+		"Consecutive commas not allowed.")
 }
 
 func TestParseRepeatArgsError1(t *testing.T) {
@@ -3478,8 +3657,8 @@ func TestParseRegexp6(t *testing.T) {
 `
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected arg after func [regexp]")
-	require.Contains(t, err.Error(), "Unclosed regexp")
+	require.Contains(t, err.Error(),
+		"Unclosed regexp")
 }
 
 func TestMain(m *testing.M) {
@@ -3511,17 +3690,6 @@ func TestCountAtRootErr(t *testing.T) {
 }
 
 func TestCountAtRootErr2(t *testing.T) {
-	query := `{
-		me(func: uid( 1)) {
-			a as count(uid)
-		}
-	}`
-	_, err := Parse(Request{Str: query})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "Cannot assign variable to count()")
-}
-
-func TestCountAtRootErr3(t *testing.T) {
 	query := `{
 		me(func: uid( 1)) {
 			count()
@@ -3572,7 +3740,7 @@ func TestDotsEOF(t *testing.T) {
 			..`
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Expected 3 periods")
+	require.Contains(t, err.Error(), "Unclosed action")
 }
 
 func TestMathWithoutVarAlias(t *testing.T) {
@@ -3585,6 +3753,34 @@ func TestMathWithoutVarAlias(t *testing.T) {
 	_, err := Parse(Request{Str: query})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Function math should be used with a variable or have an alias")
+}
+
+func TestMathDiv0(t *testing.T) {
+	tests := []struct {
+		in       string
+		hasError bool
+	}{
+		{`{f(func: uid(1)){x:math(1+1)}}`, false},
+		{`{f(func: uid(1)){x:math(1/0)}}`, true},
+		{`{f(func: uid(1)){x:math(1/-0)}}`, true},
+		{`{f(func: uid(1)){x:math(1/ln(1))}}`, true},
+		{`{f(func: uid(1)){x:math(1/sqrt(0))}}`, true},
+		{`{f(func: uid(1)){x:math(1/floor(0))}}`, true},
+		{`{f(func: uid(1)){x:math(1/floor(0.5))}}`, true},
+		{`{f(func: uid(1)){x:math(1/floor(1.01))}}`, false},
+		{`{f(func: uid(1)){x:math(1/ceil(0))}}`, true},
+		{`{f(func: uid(1)){x:math(1%0}}`, true},
+		{`{f(func: uid(1)){x:math(1%floor(0)}}`, true},
+		{`{f(func: uid(1)){x:math(1 + 0)}}`, false},
+	}
+	for _, tc := range tests {
+		_, err := Parse(Request{Str: tc.in})
+		if tc.hasError {
+			require.Error(t, err, "Expected an error for %q", tc.in)
+		} else {
+			require.NoError(t, err, "Unexpected error for %q: %s", tc.in, err)
+		}
+	}
 }
 
 func TestMultipleEqual(t *testing.T) {
@@ -3678,6 +3874,10 @@ func TestParserFuzz(t *testing.T) {
 		{"test054", "{e(orderasc:val(0)){min(val(0)0("},
 		{"test055", "{e(){@filter(p(/"},
 		{"test056", "{e(func:uid())@filter(p(/"},
+		{"test057", "a<><\\�"},
+		{"test058", "L<\\𝌀"},
+		{"test059", "{d(after:<>0)}"},
+		{"test060", "{e(orderasc:#"},
 	}
 
 	for _, test := range tests {
@@ -4106,18 +4306,19 @@ func TestParseLangTagAfterStringInFilter(t *testing.T) {
 	require.Contains(t, err.Error(), "Invalid usage of '@' in function argument")
 }
 
-func TestParseUidAsArgument(t *testing.T) {
-	// This is a fix for #1655 and #1656
-	query := `
-		{
-			q(func: gt(uid, 0)) {
-				uid
-			}
+func parseNquads(b []byte) ([]*api.NQuad, error) {
+	var nqs []*api.NQuad
+	for _, line := range bytes.Split(b, []byte{'\n'}) {
+		nq, err := rdf.Parse(string(line))
+		if err == rdf.ErrEmpty {
+			continue
 		}
-	`
-	_, err := Parse(Request{Str: query})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "Argument cannot be \"uid\"")
+		if err != nil {
+			return nil, err
+		}
+		nqs = append(nqs, &nq)
+	}
+	return nqs, nil
 }
 
 func TestParseMutation(t *testing.T) {
@@ -4135,7 +4336,7 @@ func TestParseMutation(t *testing.T) {
 	mu, err := ParseMutation(m)
 	require.NoError(t, err)
 	require.NotNil(t, mu)
-	sets, err := rdf.ConvertToNQuads(string(mu.SetNquads))
+	sets, err := parseNquads(mu.SetNquads)
 	require.NoError(t, err)
 	require.EqualValues(t, &api.NQuad{
 		Subject: "name", Predicate: "is", ObjectId: "something"},
@@ -4143,12 +4344,45 @@ func TestParseMutation(t *testing.T) {
 	require.EqualValues(t, &api.NQuad{
 		Subject: "hometown", Predicate: "is", ObjectId: "san/francisco"},
 		sets[1])
-	dels, err := rdf.ConvertToNQuads(string(mu.DelNquads))
+	dels, err := parseNquads(mu.DelNquads)
 	require.NoError(t, err)
 	require.EqualValues(t, &api.NQuad{
 		Subject: "name", Predicate: "is", ObjectId: "something-else"},
 		dels[0])
+}
 
+func TestParseMutationTooManyBlocks(t *testing.T) {
+	tests := []struct {
+		m      string
+		errStr string
+	}{
+		{m: `
+         {
+           set { _:a1 <reg> "a1 content" . }
+         }{
+		   set { _:b2 <reg> "b2 content" . }
+		 }`,
+			errStr: "Unexpected { after the end of the block.",
+		},
+		{m: `{set { _:a1 <reg> "a1 content" . }} something`,
+			errStr: "Invalid operation type: something after the end of the block",
+		},
+		{m: `
+          # comments are ok
+		  {
+		    set { _:a1 <reg> "a1 content" . } # comments are ok
+          } # comments are ok`,
+		},
+	}
+	for _, tc := range tests {
+		mu, err := ParseMutation(tc.m)
+		if tc.errStr != "" {
+			require.Contains(t, err.Error(), tc.errStr)
+			require.Nil(t, mu)
+		} else {
+			require.NoError(t, err)
+		}
+	}
 }
 
 func TestParseMissingGraphQLVar(t *testing.T) {
@@ -4169,4 +4403,284 @@ func TestParseMissingGraphQLVar(t *testing.T) {
 		t.Log(err)
 		require.Error(t, err)
 	}
+}
+
+func TestParseGraphQLVarPaginationRoot(t *testing.T) {
+	for _, q := range []string{
+		"query test($a: int = 2){ q(func: uid(0x1), first: $a) { name }}",
+		"query test($a: int = 2){ q(func: uid(0x1), offset: $a) { name }}",
+		"query test($a: int = 2){ q(func: uid(0x1), orderdesc: name, first: $a) { name }}",
+		"query test($a: int = 2){ q(func: uid(0x1), orderdesc: name, offset: $a) { name }}",
+		"query test($a: int = 2){ q(func: eq(name, \"abc\"), orderdesc: name, first: $a) { name }}",
+		"query test($a: int = 2){ q(func: eq(name, \"abc\"), orderdesc: name, offset: $a) { name }}",
+	} {
+		r := Request{
+			Str:       q,
+			Variables: map[string]string{"$a": "3"},
+		}
+		gq, err := Parse(r)
+		t.Log(q)
+		t.Log(err)
+		require.NoError(t, err)
+		args := gq.Query[0].Args
+		require.True(t, args["first"] == "3" || args["offset"] == "3")
+	}
+}
+
+func TestParseGraphQLVarPaginationChild(t *testing.T) {
+	for _, q := range []string{
+		"query test($a: int = 2){ q(func: uid(0x1)) { friend(first: $a) }}",
+		"query test($a: int = 2){ q(func: uid(0x1)) { friend(offset: $a) }}",
+		"query test($a: int = 2){ q(func: uid(0x1), orderdesc: name) { friend(first: $a) }}",
+		"query test($a: int = 2){ q(func: uid(0x1), orderdesc: name) { friend(offset: $a) }}",
+		"query test($a: int = 2){ q(func: eq(name, \"abc\"), orderdesc: name) { friend(first: $a) }}",
+		"query test($a: int = 2){ q(func: eq(name, \"abc\"), orderdesc: name) { friend(offset: $a) }}",
+	} {
+		r := Request{
+			Str:       q,
+			Variables: map[string]string{"$a": "3"},
+		}
+		gq, err := Parse(r)
+		t.Log(q)
+		t.Log(err)
+		require.NoError(t, err)
+		args := gq.Query[0].Children[0].Args
+		require.True(t, args["first"] == "3" || args["offset"] == "3")
+	}
+}
+
+func TestParseGraphQLVarPaginationRootMultiple(t *testing.T) {
+	q := `query test($a: int, $b: int, $after: string){
+		q(func: uid(0x1), first: $a, offset: $b, after: $after, orderasc: name) {
+			friend
+		}
+	}`
+
+	r := Request{
+		Str:       q,
+		Variables: map[string]string{"$a": "3", "$b": "5", "$after": "0x123"},
+	}
+	gq, err := Parse(r)
+	require.NoError(t, err)
+	args := gq.Query[0].Args
+	require.Equal(t, args["first"], "3")
+	require.Equal(t, args["offset"], "5")
+	require.Equal(t, args["after"], "0x123")
+	require.Equal(t, gq.Query[0].Order[0].Attr, "name")
+}
+
+func TestParseGraphQLVarArray(t *testing.T) {
+	tests := []struct {
+		q    string
+		vars map[string]string
+		args int
+	}{
+		{q: `query test($a: string){q(func: eq(name, [$a])) {name}}`,
+			vars: map[string]string{"$a": "srfrog"}, args: 1},
+		{q: `query test($a: string, $b: string){q(func: eq(name, [$a, $b])) {name}}`,
+			vars: map[string]string{"$a": "srfrog", "$b": "horseman"}, args: 2},
+		{q: `query test($a: string, $b: string, $c: string){q(func: eq(name, [$a, $b, $c])) {name}}`,
+			vars: map[string]string{"$a": "srfrog", "$b": "horseman", "$c": "missbug"}, args: 3},
+		// mixed var and value
+		{q: `query test($a: string){q(func: eq(name, [$a, "mrtrout"])) {name}}`,
+			vars: map[string]string{"$a": "srfrog"}, args: 2},
+		{q: `query test($a: string){q(func: eq(name, ["mrtrout", $a])) {name}}`,
+			vars: map[string]string{"$a": "srfrog"}, args: 2},
+	}
+	for _, tc := range tests {
+		gq, err := Parse(Request{Str: tc.q, Variables: tc.vars})
+		require.NoError(t, err)
+		require.Equal(t, 1, len(gq.Query))
+		require.Equal(t, "eq", gq.Query[0].Func.Name)
+		require.Equal(t, tc.args, len(gq.Query[0].Func.Args))
+		found := false
+		for _, val := range tc.vars {
+			for _, arg := range gq.Query[0].Func.Args {
+				if val == arg.Value {
+					found = true
+					break
+				}
+			}
+		}
+		require.True(t, found, "vars not matched: %v", tc.vars)
+	}
+}
+
+func TestParseGraphQLValueArray(t *testing.T) {
+	q := `
+	{
+		q(func: eq(name, ["srfrog", "horseman"])) {
+			name
+		}
+	}`
+	gq, err := Parse(Request{Str: q})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "eq", gq.Query[0].Func.Name)
+	require.Equal(t, 2, len(gq.Query[0].Func.Args))
+	require.Equal(t, "srfrog", gq.Query[0].Func.Args[0].Value)
+	require.Equal(t, "horseman", gq.Query[0].Func.Args[1].Value)
+}
+
+func TestParseGraphQLMixedVarArray(t *testing.T) {
+	q := `
+	query test($a: string, $b: string, $c: string){
+		q(func: eq(name, ["uno", $a, $b, "cuatro", $c])) {
+			name
+		}
+	}`
+	r := Request{
+		Str:       q,
+		Variables: map[string]string{"$a": "dos", "$b": "tres", "$c": "cinco"},
+	}
+	gq, err := Parse(r)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "eq", gq.Query[0].Func.Name)
+	require.Equal(t, 5, len(gq.Query[0].Func.Args))
+	require.Equal(t, "uno", gq.Query[0].Func.Args[0].Value)
+	require.Equal(t, "dos", gq.Query[0].Func.Args[1].Value)
+	require.Equal(t, "tres", gq.Query[0].Func.Args[2].Value)
+	require.Equal(t, "cuatro", gq.Query[0].Func.Args[3].Value)
+	require.Equal(t, "cinco", gq.Query[0].Func.Args[4].Value)
+}
+
+func TestLineAndColumnNumberInErrorOutput(t *testing.T) {
+	q := `
+	query {
+		me(func: uid(0x0a)) {
+			friends @filter(alloftext(descr@, "something")) {
+				name
+			}
+			gender,age
+			hometown
+		}
+	}`
+	_, err := Parse(Request{Str: q})
+	require.Error(t, err)
+	require.Contains(t, err.Error(),
+		"line 4 column 35: Unrecognized character in lexDirective: U+002C ','")
+}
+
+func TestTypeFunction(t *testing.T) {
+	q := `
+	query {
+		me(func: type(Person)) {
+			name
+		}
+	}`
+	gq, err := Parse(Request{Str: q})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "type", gq.Query[0].Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Func.Args))
+	require.Equal(t, "Person", gq.Query[0].Func.Args[0].Value)
+}
+
+func TestTypeFunctionError1(t *testing.T) {
+	q := `
+	query {
+		me(func: type(Person, School)) {
+			name
+		}
+	}`
+	_, err := Parse(Request{Str: q})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "type function only supports one argument")
+}
+
+func TestTypeInFilter(t *testing.T) {
+	q := `
+	query {
+		me(func: uid(0x01)) @filter(type(Person)) {
+			name
+		}
+	}`
+	gq, err := Parse(Request{Str: q})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "uid", gq.Query[0].Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children))
+	require.Equal(t, "name", gq.Query[0].Children[0].Attr)
+	require.Equal(t, "type", gq.Query[0].Filter.Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Filter.Func.Args))
+	require.Equal(t, "Person", gq.Query[0].Filter.Func.Args[0].Value)
+}
+
+func TestTypeFilterInPredicate(t *testing.T) {
+	q := `
+	query {
+		me(func: uid(0x01)) {
+			friend @filter(type(Person)) {
+				name
+			}
+		}
+	}`
+	gq, err := Parse(Request{Str: q})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "uid", gq.Query[0].Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children))
+	require.Equal(t, "friend", gq.Query[0].Children[0].Attr)
+
+	require.Equal(t, "type", gq.Query[0].Children[0].Filter.Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Filter.Func.Args))
+	require.Equal(t, "Person", gq.Query[0].Children[0].Filter.Func.Args[0].Value)
+
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Children))
+	require.Equal(t, "name", gq.Query[0].Children[0].Children[0].Attr)
+}
+
+func TestTypeInPredicate(t *testing.T) {
+	q := `
+	query {
+		me(func: uid(0x01)) {
+			friend @type(Person) {
+				name
+			}
+		}
+	}`
+	gq, err := Parse(Request{Str: q})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "uid", gq.Query[0].Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children))
+	require.Equal(t, "friend", gq.Query[0].Children[0].Attr)
+
+	require.Equal(t, "type", gq.Query[0].Children[0].Filter.Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Filter.Func.Args))
+	require.Equal(t, "Person", gq.Query[0].Children[0].Filter.Func.Args[0].Value)
+
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Children))
+	require.Equal(t, "name", gq.Query[0].Children[0].Children[0].Attr)
+}
+
+func TestMultipleTypeDirectives(t *testing.T) {
+	q := `
+	query {
+		me(func: uid(0x01)) {
+			friend @type(Person) {
+				pet @type(Animal) {
+					name
+				}
+			}
+		}
+	}`
+	gq, err := Parse(Request{Str: q})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gq.Query))
+	require.Equal(t, "uid", gq.Query[0].Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children))
+	require.Equal(t, "friend", gq.Query[0].Children[0].Attr)
+
+	require.Equal(t, "type", gq.Query[0].Children[0].Filter.Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Filter.Func.Args))
+	require.Equal(t, "Person", gq.Query[0].Children[0].Filter.Func.Args[0].Value)
+
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Children))
+	require.Equal(t, "pet", gq.Query[0].Children[0].Children[0].Attr)
+
+	require.Equal(t, "type", gq.Query[0].Children[0].Children[0].Filter.Func.Name)
+	require.Equal(t, 1, len(gq.Query[0].Children[0].Children[0].Filter.Func.Args))
+	require.Equal(t, "Animal", gq.Query[0].Children[0].Children[0].Filter.Func.Args[0].Value)
 }

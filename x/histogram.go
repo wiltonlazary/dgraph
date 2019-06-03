@@ -71,7 +71,7 @@ func (h *slidingHistogram) RecordValue(v int64) error {
 }
 
 // A Histogram collects observed values by keeping bucketed counts. For
-// convenience, intern.y two sets of buckets are kept: A cumulative set (i.e.
+// convenience, pb.y two sets of buckets are kept: A cumulative set (i.e.
 // data is never evicted) and a windowed set (which keeps only recently
 // collected samples).
 //
@@ -110,8 +110,4 @@ func (h *Histogram) RecordValue(v int64) {
 	if h.cumulative.RecordValue(v) != nil {
 		_ = h.cumulative.RecordValue(h.maxVal)
 	}
-}
-
-func (h *Histogram) Stats() {
-
 }

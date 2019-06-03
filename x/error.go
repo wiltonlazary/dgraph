@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,12 +25,13 @@ package x
 //     more common in Go. If you want to check for boolean being true, use
 //		   x.Assert, x.Assertf.
 // (2) You receive an error from external lib, and would like to pass on with some
-//     stack trace information. In this case, use x.Wrap or x.Wrapf.
-// (3) You want to generate a new error with stack trace info. Use x.Errorf.
+//     stack trace information. In this case, use x.Wrap or errors.Wrapf.
+// (3) You want to generate a new error with stack trace info. Use errors.Errorf.
 
 import (
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/pkg/errors"
 )
@@ -38,20 +39,40 @@ import (
 // Check logs fatal if err != nil.
 func Check(err error) {
 	if err != nil {
-		log.Fatalf("%+v", Wrap(err))
+		log.Fatalf("%+v", errors.Wrap(err, ""))
 	}
 }
 
 // Checkf is Check with extra info.
 func Checkf(err error, format string, args ...interface{}) {
 	if err != nil {
-		log.Fatalf("%+v", Wrapf(err, format, args...))
+		log.Fatalf("%+v", errors.Wrapf(err, format, args...))
+	}
+}
+
+// CheckfNoTrace is Checkf without a stack trace.
+func CheckfNoTrace(err error) {
+	if err != nil {
+		log.Fatalf(err.Error())
+	}
+}
+
+// CheckfNoLog exits on error without any message (to avoid duplicate error messages).
+func CheckfNoLog(err error) {
+	if err != nil {
+		os.Exit(1)
 	}
 }
 
 // Check2 acts as convenience wrapper around Check, using the 2nd argument as error.
 func Check2(_ interface{}, err error) {
 	Check(err)
+}
+
+// Ignore function is used to ignore errors deliberately, while keeping the
+// linter happy.
+func Ignore(_ error) {
+	// Do nothing.
 }
 
 // AssertTrue asserts that b is true. Otherwise, it would log fatal.
@@ -68,34 +89,11 @@ func AssertTruef(b bool, format string, args ...interface{}) {
 	}
 }
 
+// AssertTruefNoTrace is AssertTruef without a stack trace.
 func AssertTruefNoTrace(b bool, format string, args ...interface{}) {
 	if !b {
 		log.Fatalf("%+v", fmt.Errorf(format, args...))
 	}
-}
-
-// Wrap wraps errors from external lib.
-func Wrap(err error) error {
-	return errors.Wrap(err, "")
-}
-
-// Wrapf is Wrap with extra info.
-func Wrapf(err error, format string, args ...interface{}) error {
-	if err == nil {
-		return nil
-	}
-	if !Config.DebugMode {
-		return fmt.Errorf(format+" error: %+v", append(args, err)...)
-	}
-	return errors.Wrapf(err, format, args...)
-}
-
-// Errorf creates a new error with stack trace, etc.
-func Errorf(format string, args ...interface{}) error {
-	if !Config.DebugMode {
-		return fmt.Errorf(format, args...)
-	}
-	return errors.Errorf(format, args...)
 }
 
 // Fatalf logs fatal.

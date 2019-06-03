@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,7 @@ package types
 import (
 	"testing"
 
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,12 +44,12 @@ func getInput(t *testing.T, tid TypeID, in []string) [][]Val {
 	return list
 }
 
-func getUIDList(n int) *intern.List {
+func getUIDList(n int) *pb.List {
 	data := make([]uint64, 0, n)
 	for i := 1; i <= n; i++ {
 		data = append(data, uint64(i*100))
 	}
-	return &intern.List{data}
+	return &pb.List{Uids: data}
 }
 
 func TestSortStrings(t *testing.T) {
@@ -76,7 +76,7 @@ func TestSortFloats(t *testing.T) {
 	require.NoError(t, Sort(list, ul, []bool{false}))
 	require.EqualValues(t, []uint64{400, 200, 300, 100}, ul.Uids)
 	require.EqualValues(t,
-		[]string{"2.12E+00", "1.12E+01", "1.15E+01", "2.22E+01"},
+		[]string{"2.12", "11.2", "11.5", "22.2"},
 		toString(t, list, FloatID))
 }
 
@@ -86,7 +86,7 @@ func TestSortFloatsDesc(t *testing.T) {
 	require.NoError(t, Sort(list, ul, []bool{true}))
 	require.EqualValues(t, []uint64{100, 300, 200, 400}, ul.Uids)
 	require.EqualValues(t,
-		[]string{"2.22E+01", "1.15E+01", "1.12E+01", "2.12E+00"},
+		[]string{"22.2", "11.5", "11.2", "2.12"},
 		toString(t, list, FloatID))
 }
 
@@ -109,16 +109,42 @@ func TestSortDateTimes(t *testing.T) {
 
 func TestSortIntAndFloat(t *testing.T) {
 	list := [][]Val{
-		[]Val{Val{Tid: IntID, Value: int64(55)}},
-		[]Val{Val{Tid: FloatID, Value: 21.5}},
-		[]Val{Val{Tid: IntID, Value: int64(100)}},
+		{{Tid: IntID, Value: int64(55)}},
+		{{Tid: FloatID, Value: 21.5}},
+		{{Tid: IntID, Value: int64(100)}},
 	}
 	ul := getUIDList(3)
 	require.NoError(t, Sort(list, ul, []bool{false}))
 	require.EqualValues(t, []uint64{200, 100, 300}, ul.Uids)
 	require.EqualValues(t,
-		[]string{"2.15E+01", "55", "100"},
+		[]string{"21.5", "55", "100"},
 		toString(t, list, DateTimeID))
+
+}
+
+func TestEqual(t *testing.T) {
+	require.True(t, equal(Val{Tid: IntID, Value: int64(3)}, Val{Tid: IntID, Value: int64(3)}),
+		"equal should return true for two equal values")
+
+	require.False(t, equal(Val{Tid: IntID, Value: int64(3)}, Val{Tid: IntID, Value: int64(4)}),
+		"equal should return false for two different values")
+
+	// not equal when the types are different
+	require.False(t, equal(Val{Tid: IntID, Value: int64(3)}, Val{Tid: FloatID, Value: float64(3.0)}),
+		"equal should return false for two values with different types")
+
+	// not equal when either parameter has the Value field being nil
+	require.False(t, equal(Val{Tid: IntID, Value: int64(3)}, Val{Tid: IntID}),
+		"equal should return false when either parameter cannot have its value converted")
+	require.False(t, equal(Val{Tid: IntID}, Val{Tid: IntID, Value: int64(3)}),
+		"equal should return false when either parameter cannot have its value converted")
+	require.False(t, equal(Val{Tid: IntID}, Val{Tid: IntID}), "equal should return false when either parameter cannot have its value converted")
+
+	// not equal when there is a type mismatch between value and tid for either parameter
+	require.False(t, equal(Val{Tid: IntID, Value: float64(3.0)}, Val{Tid: FloatID, Value: float64(3.0)}),
+		"equal should return false when either parameter's value has a type mismatch with its Tid")
+	require.False(t, equal(Val{Tid: FloatID, Value: float64(3.0)}, Val{Tid: IntID, Value: float64(3.0)}),
+		"equal should return false when either parameter's value has a type mismatch with its Tid")
 
 }
 
@@ -134,13 +160,13 @@ func findIndex(t *testing.T, uids []uint64, uid uint64) int {
 
 func TestSortMismatchedTypes(t *testing.T) {
 	list := [][]Val{
-		[]Val{Val{Tid: StringID, Value: "cat"}},
-		[]Val{Val{Tid: IntID, Value: int64(55)}},
-		[]Val{Val{Tid: BoolID, Value: true}},
-		[]Val{Val{Tid: FloatID, Value: 21.5}},
-		[]Val{Val{Tid: StringID, Value: "aardvark"}},
-		[]Val{Val{Tid: StringID, Value: "buffalo"}},
-		[]Val{Val{Tid: FloatID, Value: 33.33}},
+		{{Tid: StringID, Value: "cat"}},
+		{{Tid: IntID, Value: int64(55)}},
+		{{Tid: BoolID, Value: true}},
+		{{Tid: FloatID, Value: 21.5}},
+		{{Tid: StringID, Value: "aardvark"}},
+		{{Tid: StringID, Value: "buffalo"}},
+		{{Tid: FloatID, Value: 33.33}},
 	}
 	ul := getUIDList(7)
 	require.NoError(t, Sort(list, ul, []bool{false}))

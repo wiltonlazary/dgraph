@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
@@ -21,37 +20,59 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"path"
-	"strconv"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
+	"unicode"
 
-	"github.com/dgraph-io/badger"
+	"github.com/golang/glog"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/dgraph-io/badger"
+	bpb "github.com/dgraph-io/badger/pb"
+
+	"github.com/dgraph-io/dgo/protos/api"
+
 	"github.com/dgraph-io/dgraph/posting"
-	"github.com/dgraph-io/dgraph/protos/intern"
-	"github.com/dgraph-io/dgraph/schema"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/types/facets"
 	"github.com/dgraph-io/dgraph/x"
-	"golang.org/x/net/trace"
 )
 
-const numExportRoutines = 100
+// DefaultExportFormat stores the name of the default format for exports.
+const DefaultExportFormat = "rdf"
 
-type kv struct {
-	prefix string
-	key    []byte
+type exportFormat struct {
+	ext  string // file extension
+	pre  string // string to write before exported records
+	post string // string to write after exported records
 }
 
-type skv struct {
-	attr   string
-	schema *intern.SchemaUpdate
+var exportFormats = map[string]exportFormat{
+	"json": {
+		ext:  ".json",
+		pre:  "[\n",
+		post: "\n]\n",
+	},
+	"rdf": {
+		ext:  ".rdf",
+		pre:  "",
+		post: "",
+	},
+}
+
+type exporter struct {
+	pl      *posting.List
+	uid     uint64
+	attr    string
+	readTs  uint64
+	counter int
 }
 
 // Map from our types to RDF type. Useful when writing storage types
@@ -65,418 +86,536 @@ var rdfTypeMap = map[types.TypeID]string{
 	types.BoolID:     "xs:boolean",
 	types.GeoID:      "geo:geojson",
 	types.BinaryID:   "xs:base64Binary",
-	types.PasswordID: "xs:string",
+	types.PasswordID: "xs:password",
 }
 
-func toRDF(buf *bytes.Buffer, item kv, readTs uint64) {
-	l := posting.GetNoStore(item.key)
-	err := l.Iterate(readTs, 0, func(p *intern.Posting) bool {
-		buf.WriteString(item.prefix)
-		if p.PostingType != intern.Posting_REF {
-			// Value posting
-			// Convert to appropriate type
-			vID := types.TypeID(p.ValType)
-			src := types.ValueForType(vID)
-			src.Value = p.Value
-			str, err := types.Convert(src, types.StringID)
-			x.Check(err)
-			buf.WriteString(strconv.Quote(str.Value.(string)))
-			if p.PostingType == intern.Posting_VALUE_LANG {
-				buf.WriteByte('@')
-				buf.WriteString(string(p.LangTag))
-			} else if vID != types.DefaultID {
-				rdfType, ok := rdfTypeMap[vID]
-				x.AssertTruef(ok, "Didn't find RDF type for dgraph type: %+v", vID.Name())
-				buf.WriteString("^^<")
-				buf.WriteString(rdfType)
-				buf.WriteByte('>')
-			}
+// Having '<' and '>' around all predicates makes the exported schema harder
+// for humans to look at, so only put them on predicates containing "exotic"
+// characters (i.e. ones not in this list).
+var predNonSpecialChars = unicode.RangeTable{
+	R16: []unicode.Range16{
+		// Ranges must be in order.
+		{'.', '.', 1},
+		{'0', '9', 1},
+		{'A', 'Z', 1},
+		{'_', '_', 1},
+		{'a', 'z', 1},
+	},
+}
+
+// UIDs like 0x1 look weird but 64-bit ones like 0x0000000000000001 are too long.
+var uidFmtStrRdf = "<0x%x>"
+var uidFmtStrJson = "\"0x%x\""
+
+// valToStr converts a posting value to a string.
+func valToStr(v types.Val) (string, error) {
+	v2, err := types.Convert(v, types.StringID)
+	if err != nil {
+		return "", fmt.Errorf("converting %v to string: %v\n", v2.Value, err)
+	}
+
+	// Strip terminating null, if any.
+	return strings.TrimRight(v2.Value.(string), "\x00"), nil
+}
+
+// facetToString convert a facet value to a string.
+func facetToString(fct *api.Facet) (string, error) {
+	v1, err := facets.ValFor(fct)
+	if err != nil {
+		return "", fmt.Errorf("getting value from facet %#v: %v", fct, err)
+	}
+
+	v2 := &types.Val{Tid: types.StringID}
+	if err = types.Marshal(v1, v2); err != nil {
+		return "", fmt.Errorf("marshaling facet value %v to string: %v", v1, err)
+	}
+
+	return v2.Value.(string), nil
+}
+
+// escapedString converts a string into an escaped string for exports.
+func escapedString(str string) string {
+	// We use the Marshal function in the JSON package for all export formats
+	// because it properly escapes strings.
+	byt, err := json.Marshal(str)
+	if err != nil {
+		// All valid stings should be able to be escaped to a JSON string so
+		// it's safe to panic here. Marshal has to return an error because it
+		// accepts an interface.
+		panic("Could not marshal string to JSON string")
+	}
+	return string(byt)
+}
+
+func (e *exporter) toJSON() (*bpb.KVList, error) {
+	bp := new(bytes.Buffer)
+
+	if e.counter != 1 {
+		fmt.Fprint(bp, ",\n")
+	}
+
+	// We could output more compact JSON at the cost of code complexity.
+	// Leaving it simple for now.
+
+	continuing := false
+	mapStart := fmt.Sprintf("  {\"uid\":"+uidFmtStrJson, e.uid)
+	err := e.pl.Iterate(e.readTs, 0, func(p *pb.Posting) error {
+		if continuing {
+			fmt.Fprint(bp, ",\n")
 		} else {
-			buf.WriteString("_:uid")
-			buf.WriteString(strconv.FormatUint(p.Uid, 16))
+			continuing = true
 		}
-		// Label
-		if len(p.Label) > 0 {
-			buf.WriteString(" <")
-			buf.WriteString(p.Label)
-			buf.WriteByte('>')
-		}
-		// Facets.
-		fcs := p.Facets
-		if len(fcs) != 0 {
-			buf.WriteString(" (")
-			for i, f := range fcs {
-				if i != 0 {
-					buf.WriteByte(',')
-				}
-				buf.WriteString(f.Key)
-				buf.WriteByte('=')
-				fVal := &types.Val{Tid: types.StringID}
-				x.Check(types.Marshal(facets.ValFor(f), fVal))
-				if facets.TypeIDFor(f) == types.StringID {
-					buf.WriteString(strconv.Quote(fVal.Value.(string)))
-				} else {
-					buf.WriteString(fVal.Value.(string))
-				}
+
+		fmt.Fprint(bp, mapStart)
+		if p.PostingType == pb.Posting_REF {
+			fmt.Fprintf(bp, `,"%s":[`, e.attr)
+			fmt.Fprintf(bp, "{\"uid\":"+uidFmtStrJson+"}", p.Uid)
+			fmt.Fprint(bp, "]")
+		} else {
+			if p.PostingType == pb.Posting_VALUE_LANG {
+				fmt.Fprintf(bp, `,"%s@%s":`, e.attr, string(p.LangTag))
+			} else {
+				fmt.Fprintf(bp, `,"%s":`, e.attr)
 			}
-			buf.WriteByte(')')
+
+			val := types.Val{Tid: types.TypeID(p.ValType), Value: p.Value}
+			str, err := valToStr(val)
+			if err != nil {
+				// Copying this behavior from RDF exporter.
+				// TODO Investigate why returning here before before completely
+				//      exporting this posting is not considered data loss.
+				glog.Errorf("Ignoring error: %+v\n", err)
+				return nil
+			}
+
+			if !val.Tid.IsNumber() {
+				str = escapedString(str)
+			}
+
+			fmt.Fprint(bp, str)
+		}
+
+		for _, fct := range p.Facets {
+			fmt.Fprintf(bp, `,"%s|%s":`, e.attr, fct.Key)
+
+			str, err := facetToString(fct)
+			if err != nil {
+				glog.Errorf("Ignoring error: %+v", err)
+				return nil
+			}
+
+			tid, err := facets.TypeIDFor(fct)
+			if err != nil {
+				glog.Errorf("Error getting type id from facet %#v: %v", fct, err)
+				continue
+			}
+
+			if !tid.IsNumber() {
+				str = escapedString(str)
+			}
+
+			fmt.Fprint(bp, str)
+		}
+
+		fmt.Fprint(bp, "}")
+		return nil
+	})
+
+	kv := &bpb.KV{
+		Value:   bp.Bytes(),
+		Version: 1,
+	}
+	return listWrap(kv), err
+}
+
+func (e *exporter) toRDF() (*bpb.KVList, error) {
+	bp := new(bytes.Buffer)
+
+	prefix := fmt.Sprintf(uidFmtStrRdf+" <%s> ", e.uid, e.attr)
+	err := e.pl.Iterate(e.readTs, 0, func(p *pb.Posting) error {
+		fmt.Fprint(bp, prefix)
+		if p.PostingType == pb.Posting_REF {
+			fmt.Fprint(bp, fmt.Sprintf(uidFmtStrRdf, p.Uid))
+		} else {
+			val := types.Val{Tid: types.TypeID(p.ValType), Value: p.Value}
+			str, err := valToStr(val)
+			if err != nil {
+				glog.Errorf("Ignoring error: %+v\n", err)
+				return nil
+			}
+			fmt.Fprintf(bp, "%s", escapedString(str))
+
+			tid := types.TypeID(p.ValType)
+			if p.PostingType == pb.Posting_VALUE_LANG {
+				fmt.Fprint(bp, "@"+string(p.LangTag))
+			} else if tid != types.DefaultID {
+				rdfType, ok := rdfTypeMap[tid]
+				x.AssertTruef(ok, "Didn't find RDF type for dgraph type: %+v", tid.Name())
+				fmt.Fprint(bp, "^^<"+rdfType+">")
+			}
+		}
+		// Let's skip labels. Dgraph doesn't support them for any functionality.
+
+		// Facets.
+		if len(p.Facets) != 0 {
+			fmt.Fprint(bp, " (")
+			for i, fct := range p.Facets {
+				if i != 0 {
+					fmt.Fprint(bp, ",")
+				}
+				fmt.Fprint(bp, fct.Key+"=")
+
+				str, err := facetToString(fct)
+				if err != nil {
+					glog.Errorf("Ignoring error: %+v", err)
+					return nil
+				}
+
+				tid, err := facets.TypeIDFor(fct)
+				if err != nil {
+					glog.Errorf("Error getting type id from facet %#v: %v", fct, err)
+					continue
+				}
+
+				if tid == types.StringID {
+					str = escapedString(str)
+				}
+				fmt.Fprint(bp, str)
+			}
+			fmt.Fprint(bp, ")")
 		}
 		// End dot.
-		buf.WriteString(" .\n")
-		return true
+		fmt.Fprint(bp, " .\n")
+		return nil
 	})
-	if err != nil {
-		// TODO: Throw error back to the user.
-		// Ensure that we are not missing errCheck at other places.
-		x.Printf("Error while exporting :%v\n", err)
+
+	kv := &bpb.KV{
+		Value:   bp.Bytes(),
+		Version: 1,
 	}
+	return listWrap(kv), err
 }
 
-func toSchema(buf *bytes.Buffer, s *skv) {
-	if strings.ContainsRune(s.attr, ':') {
+func toSchema(attr string, update pb.SchemaUpdate) (*bpb.KVList, error) {
+	// bytes.Buffer never returns error for any of the writes. So, we don't need to check them.
+	var buf bytes.Buffer
+	isSpecial := func(r rune) bool {
+		return !(unicode.In(r, &predNonSpecialChars))
+	}
+	if strings.IndexFunc(attr, isSpecial) >= 0 {
 		buf.WriteRune('<')
-		buf.WriteString(s.attr)
+		buf.WriteString(attr)
 		buf.WriteRune('>')
 	} else {
-		buf.WriteString(s.attr)
+		buf.WriteString(attr)
 	}
 	buf.WriteByte(':')
-	isList := schema.State().IsList(s.attr)
-	if isList {
+	if update.List {
 		buf.WriteRune('[')
 	}
-	buf.WriteString(types.TypeID(s.schema.ValueType).Name())
-	if isList {
+	buf.WriteString(types.TypeID(update.ValueType).Name())
+	if update.List {
 		buf.WriteRune(']')
 	}
-	if s.schema.Directive == intern.SchemaUpdate_REVERSE {
+	if update.Directive == pb.SchemaUpdate_REVERSE {
 		buf.WriteString(" @reverse")
-	} else if s.schema.Directive == intern.SchemaUpdate_INDEX && len(s.schema.Tokenizer) > 0 {
+	} else if update.Directive == pb.SchemaUpdate_INDEX && len(update.Tokenizer) > 0 {
 		buf.WriteString(" @index(")
-		buf.WriteString(strings.Join(s.schema.Tokenizer, ","))
+		buf.WriteString(strings.Join(update.Tokenizer, ","))
 		buf.WriteByte(')')
 	}
-	if s.schema.Count {
+	if update.Count {
 		buf.WriteString(" @count")
 	}
+	if update.Lang {
+		buf.WriteString(" @lang")
+	}
+	if update.Upsert {
+		buf.WriteString(" @upsert")
+	}
 	buf.WriteString(" . \n")
+	kv := &bpb.KV{
+		Value:   buf.Bytes(),
+		Version: 2, // Schema value
+	}
+	return listWrap(kv), nil
 }
 
-func writeToFile(fpath string, ch chan []byte) error {
-	f, err := os.Create(fpath)
-	if err != nil {
-		return err
-	}
-
-	defer f.Close()
-	x.Check(err)
-	w := bufio.NewWriterSize(f, 1000000)
-	gw, err := gzip.NewWriterLevel(w, gzip.BestCompression)
-	if err != nil {
-		return err
-	}
-
-	for buf := range ch {
-		if _, err := gw.Write(buf); err != nil {
-			return err
-		}
-	}
-	if err := gw.Flush(); err != nil {
-		return err
-	}
-	if err := gw.Close(); err != nil {
-		return err
-	}
-	return w.Flush()
+type fileWriter struct {
+	fd *os.File
+	bw *bufio.Writer
+	gw *gzip.Writer
 }
 
-// Export creates a export of data by exporting it as an RDF gzip.
-func export(bdir string, readTs uint64) error {
-	// Use a goroutine to write to file.
-	err := os.MkdirAll(bdir, 0700)
+func (writer *fileWriter) open(fpath string) error {
+	var err error
+	writer.fd, err = os.Create(fpath)
 	if err != nil {
 		return err
 	}
-	gid := groups().groupId()
-	fpath := path.Join(bdir, fmt.Sprintf("dgraph-%d-%s.rdf.gz", gid,
-		time.Now().Format("2006-01-02-15-04")))
-	fspath := path.Join(bdir, fmt.Sprintf("dgraph-%d-%s.schema.gz", gid,
-		time.Now().Format("2006-01-02-15-04")))
-	x.Printf("Exporting to: %v, schema at %v\n", fpath, fspath)
-	chb := make(chan []byte, 1000)
-	errChan := make(chan error, 2)
-	go func() {
-		errChan <- writeToFile(fpath, chb)
-	}()
-	chsb := make(chan []byte, 1000)
-	go func() {
-		errChan <- writeToFile(fspath, chsb)
-	}()
 
-	// Use a bunch of goroutines to convert to RDF format.
-	chkv := make(chan kv, 1000)
-	var wg sync.WaitGroup
-	wg.Add(numExportRoutines)
-	for i := 0; i < numExportRoutines; i++ {
-		go func(i int) {
-			buf := new(bytes.Buffer)
-			buf.Grow(50000)
-			for item := range chkv {
-				toRDF(buf, item, readTs)
-				if buf.Len() >= 40000 {
-					tmp := make([]byte, buf.Len())
-					copy(tmp, buf.Bytes())
-					chb <- tmp
-					buf.Reset()
-				}
-			}
-			if buf.Len() > 0 {
-				tmp := make([]byte, buf.Len())
-				copy(tmp, buf.Bytes())
-				chb <- tmp
-			}
-			wg.Done()
-		}(i)
-	}
-
-	// Use a goroutine to convert protos.Schema to string
-	chs := make(chan *skv, 1000)
-	wg.Add(1)
-	go func() {
-		buf := new(bytes.Buffer)
-		buf.Grow(50000)
-		for item := range chs {
-			toSchema(buf, item)
-			if buf.Len() >= 40000 {
-				tmp := make([]byte, buf.Len())
-				copy(tmp, buf.Bytes())
-				chsb <- tmp
-				buf.Reset()
-			}
-		}
-		if buf.Len() > 0 {
-			tmp := make([]byte, buf.Len())
-			copy(tmp, buf.Bytes())
-			chsb <- tmp
-		}
-		wg.Done()
-	}()
-
-	// Iterate over key-value store
-	txn := pstore.NewTransactionAt(readTs, false)
-	defer txn.Discard()
-	iterOpts := badger.DefaultIteratorOptions
-	iterOpts.PrefetchValues = false
-	it := txn.NewIterator(iterOpts)
-	defer it.Close()
-	prefix := new(bytes.Buffer)
-	prefix.Grow(100)
-	var debugCount int
-	for it.Rewind(); it.Valid(); debugCount++ {
-		item := it.Item()
-		key := item.Key()
-		pk := x.Parse(key)
-		if pk == nil {
-			it.Next()
-			continue
-		}
-
-		if pk.IsIndex() || pk.IsReverse() || pk.IsCount() {
-			// Seek to the end of index, reverse and count keys.
-			it.Seek(pk.SkipRangeOfSameType())
-			continue
-		}
-
-		// Skip if we don't serve the tablet.
-		if !groups().ServesTablet(pk.Attr) {
-			if pk.IsData() {
-				it.Seek(pk.SkipPredicate())
-			} else if pk.IsSchema() {
-				it.Seek(pk.SkipSchema())
-			}
-			continue
-		}
-
-		if pk.Attr == "_predicate_" || pk.Attr == "_dummy_" {
-			// Skip the UID mappings.
-			it.Seek(pk.SkipPredicate())
-			continue
-		}
-
-		if pk.IsSchema() {
-			s := &intern.SchemaUpdate{}
-			val, err := item.Value()
-			if err != nil {
-				return err
-			}
-			x.Check(s.Unmarshal(val))
-			chs <- &skv{
-				attr:   pk.Attr,
-				schema: s,
-			}
-			// skip predicate
-			it.Next()
-			continue
-		}
-		x.AssertTrue(pk.IsData())
-		pred, uid := pk.Attr, pk.Uid
-		prefix.WriteString("<_:uid")
-		prefix.WriteString(strconv.FormatUint(uid, 16))
-		prefix.WriteString("> <")
-		prefix.WriteString(pred)
-		prefix.WriteString("> ")
-		nkey := make([]byte, len(key))
-		copy(nkey, key)
-		chkv <- kv{
-			prefix: prefix.String(),
-			key:    nkey,
-		}
-		prefix.Reset()
-		it.Next()
-	}
-
-	close(chkv) // We have stopped output to chkv.
-	close(chs)  // we have stopped output to chs (schema)
-	wg.Wait()   // Wait for numExportRoutines to finish.
-	close(chb)  // We have stopped output to chb.
-	close(chsb) // we have stopped output to chs (schema)
-
-	err = <-errChan
-	err = <-errChan
+	writer.bw = bufio.NewWriterSize(writer.fd, 1e6)
+	writer.gw, err = gzip.NewWriterLevel(writer.bw, gzip.BestCompression)
 	return err
 }
 
-// TODO: How do we want to handle export for group, do we pause mutations, sync all and then export ?
-// TODO: Should we move export logic to dgraphzero?
-func handleExportForGroupOverNetwork(ctx context.Context, in *intern.ExportPayload) *intern.ExportPayload {
-	n := groups().Node
-	if in.GroupId == groups().groupId() && n != nil && n.AmLeader() {
-		return handleExportForGroup(ctx, in)
+func (writer *fileWriter) Close() error {
+	if err := writer.gw.Flush(); err != nil {
+		return err
 	}
-
-	pl := groups().Leader(in.GroupId)
-	if pl == nil {
-		// Unable to find any connection to any of these servers. This should be exceedingly rare.
-		// But probably not worthy of crashing the server. We can just skip the export.
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Unable to find a server to export group: %d", in.GroupId)
-		}
-		in.Status = intern.ExportPayload_FAILED
-		return in
+	if err := writer.gw.Close(); err != nil {
+		return err
 	}
-
-	c := intern.NewWorkerClient(pl.Get())
-	nrep, err := c.Export(ctx, in)
-	if err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf(err.Error())
-		}
-		in.Status = intern.ExportPayload_FAILED
-		return in
+	if err := writer.bw.Flush(); err != nil {
+		return err
 	}
-	return nrep
+	if err := writer.fd.Sync(); err != nil {
+		return err
+	}
+	return writer.fd.Close()
 }
 
-func handleExportForGroup(ctx context.Context, in *intern.ExportPayload) *intern.ExportPayload {
-	n := groups().Node
-	if in.GroupId != groups().groupId() || !n.AmLeader() {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("I am not leader of group %d.", in.GroupId)
+// export creates a export of data by exporting it as an RDF gzip.
+func export(ctx context.Context, in *pb.ExportRequest) error {
+	if in.GroupId != groups().groupId() {
+		return errors.Errorf("Export request group mismatch. Mine: %d. Requested: %d\n",
+			groups().groupId(), in.GroupId)
+	}
+	glog.Infof("Export requested at %d.", in.ReadTs)
+
+	// Let's wait for this server to catch up to all the updates until this ts.
+	if err := posting.Oracle().WaitForTs(ctx, in.ReadTs); err != nil {
+		return err
+	}
+	glog.Infof("Running export for group %d at timestamp %d.", in.GroupId, in.ReadTs)
+
+	uts := time.Unix(in.UnixTs, 0)
+	bdir := path.Join(x.WorkerConfig.ExportPath, fmt.Sprintf(
+		"dgraph.r%d.u%s", in.ReadTs, uts.UTC().Format("0102.1504")))
+
+	if err := os.MkdirAll(bdir, 0700); err != nil {
+		return err
+	}
+
+	xfmt := exportFormats[in.Format]
+	path := func(suffix string) (string, error) {
+		return filepath.Abs(path.Join(bdir, fmt.Sprintf("g%02d%s", in.GroupId, suffix)))
+	}
+
+	// Open data file now.
+	dataPath, err := path(xfmt.ext + ".gz")
+	if err != nil {
+		return err
+	}
+
+	glog.Infof("Exporting data for group: %d at %s\n", in.GroupId, dataPath)
+	dataWriter := &fileWriter{}
+	if err := dataWriter.open(dataPath); err != nil {
+		return err
+	}
+
+	// Open schema file now.
+	schemaPath, err := path(".schema.gz")
+	if err != nil {
+		return err
+	}
+	glog.Infof("Exporting schema for group: %d at %s\n", in.GroupId, schemaPath)
+	schemaWriter := &fileWriter{}
+	if err := schemaWriter.open(schemaPath); err != nil {
+		return err
+	}
+
+	e := &exporter{
+		readTs:  in.ReadTs,
+		counter: 0,
+	}
+
+	stream := pstore.NewStreamAt(in.ReadTs)
+	stream.LogPrefix = "Export"
+	stream.ChooseKey = func(item *badger.Item) bool {
+		pk := x.Parse(item.Key())
+		// _predicate_ is deprecated but leaving this here so that users with a
+		// binary with version >= 1.1 can export data from a version < 1.1 without
+		// this internal data showing up.
+		if pk.Attr == "_predicate_" {
+			return false
 		}
-		in.Status = intern.ExportPayload_FAILED
-		return in
-	}
-	n.applyAllMarks(n.ctx)
-	if tr, ok := trace.FromContext(ctx); ok {
-		tr.LazyPrintf("Leader of group: %d. Running export.", in.GroupId)
-	}
-	if err := export(Config.ExportPath, in.ReadTs); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf(err.Error())
+		if servesTablet, err := groups().ServesTablet(pk.Attr); err != nil || !servesTablet {
+			return false
 		}
-		in.Status = intern.ExportPayload_FAILED
-		return in
+		// We need to ensure that schema keys are separately identifiable, so they can be
+		// written to a different file.
+		return pk.IsData() || pk.IsSchema()
 	}
-	if tr, ok := trace.FromContext(ctx); ok {
-		tr.LazyPrintf("Export done for group: %d.", in.GroupId)
+	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
+		item := itr.Item()
+		pk := x.Parse(item.Key())
+
+		e.counter += 1
+		e.uid = pk.Uid
+		e.attr = pk.Attr
+
+		switch {
+		case pk.IsSchema():
+			// Schema should be handled first. Because schema keys are also considered data keys.
+			var update pb.SchemaUpdate
+			err := item.Value(func(val []byte) error {
+				return update.Unmarshal(val)
+			})
+			if err != nil {
+				// Let's not propagate this error. We just log this and continue onwards.
+				glog.Errorf("Unable to unmarshal schema: %+v. Err=%v\n", pk, err)
+				return nil, nil
+			}
+			return toSchema(pk.Attr, update)
+
+		case pk.IsData():
+			e.pl, err = posting.ReadPostingList(key, itr)
+			if err != nil {
+				return nil, err
+			}
+			switch in.Format {
+			case "json":
+				return e.toJSON()
+			case "rdf":
+				return e.toRDF()
+			default:
+				glog.Fatalf("Invalid export format found: %s", in.Format)
+			}
+
+		default:
+			glog.Fatalf("Invalid key found: %+v\n", pk)
+		}
+		return nil, nil
 	}
-	in.Status = intern.ExportPayload_SUCCESS
-	return in
+
+	stream.Send = func(list *bpb.KVList) error {
+		for _, kv := range list.Kv {
+			var writer *fileWriter
+			switch kv.Version {
+			case 1: // data
+				writer = dataWriter
+			case 2: // schema
+				writer = schemaWriter
+			default:
+				glog.Fatalf("Invalid data type found: %x", kv.Key)
+			}
+			if _, err := writer.gw.Write(kv.Value); err != nil {
+				return err
+			}
+		}
+		// Once all the sends are done, writers must be flushed and closed in order.
+		return nil
+	}
+
+	// All prepwork done. Time to roll.
+	if _, err = dataWriter.gw.Write([]byte(xfmt.pre)); err != nil {
+		return err
+	}
+	if err := stream.Orchestrate(ctx); err != nil {
+		return err
+	}
+	if _, err = dataWriter.gw.Write([]byte(xfmt.post)); err != nil {
+		return err
+	}
+	if err := dataWriter.Close(); err != nil {
+		return err
+	}
+	if err := schemaWriter.Close(); err != nil {
+		return err
+	}
+	glog.Infof("Export DONE for group %d at timestamp %d.", in.GroupId, in.ReadTs)
+	return nil
 }
 
 // Export request is used to trigger exports for the request list of groups.
 // If a server receives request to export a group that it doesn't handle, it would
 // automatically relay that request to the server that it thinks should handle the request.
-func (w *grpcWorker) Export(ctx context.Context, req *intern.ExportPayload) (*intern.ExportPayload, error) {
-	reply := &intern.ExportPayload{ReqId: req.ReqId, GroupId: req.GroupId}
-	reply.Status = intern.ExportPayload_FAILED // Set by default.
-
+func (w *grpcWorker) Export(ctx context.Context, req *pb.ExportRequest) (*pb.Status, error) {
+	glog.Infof("Received export request via Grpc: %+v\n", req)
 	if ctx.Err() != nil {
-		return reply, ctx.Err()
-	}
-	if !w.addIfNotPresent(req.ReqId) {
-		reply.Status = intern.ExportPayload_DUPLICATE
-		return reply, nil
+		glog.Errorf("Context error during export: %v\n", ctx.Err())
+		return nil, ctx.Err()
 	}
 
-	chb := make(chan *intern.ExportPayload, 1)
-	go func() {
-		chb <- handleExportForGroup(ctx, req)
-	}()
-
-	select {
-	case rep := <-chb:
-		return rep, nil
-	case <-ctx.Done():
-		return reply, ctx.Err()
+	glog.Infof("Issuing export request...")
+	if err := export(ctx, req); err != nil {
+		glog.Errorf("While running export. Request: %+v. Error=%v\n", req, err)
+		return nil, err
 	}
+	glog.Infof("Export request: %+v OK.\n", req)
+	return &pb.Status{Msg: "SUCCESS"}, nil
 }
 
-func ExportOverNetwork(ctx context.Context) error {
+func handleExportOverNetwork(ctx context.Context, in *pb.ExportRequest) error {
+	if in.GroupId == groups().groupId() {
+		return export(ctx, in)
+	}
+
+	pl := groups().Leader(in.GroupId)
+	if pl == nil {
+		return errors.Errorf("Unable to find leader of group: %d\n", in.GroupId)
+	}
+
+	glog.Infof("Sending export request to group: %d, addr: %s\n", in.GroupId, pl.Addr)
+	c := pb.NewWorkerClient(pl.Get())
+	_, err := c.Export(ctx, in)
+	if err != nil {
+		glog.Errorf("Export error received from group: %d. Error: %v\n", in.GroupId, err)
+	}
+	return err
+}
+
+func ExportOverNetwork(ctx context.Context, format string) error {
 	// If we haven't even had a single membership update, don't run export.
 	if err := x.HealthCheck(); err != nil {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Request rejected %v", err)
-		}
+		glog.Errorf("Rejecting export request due to health check error: %v\n", err)
 		return err
 	}
 	// Get ReadTs from zero and wait for stream to catch up.
-	ts, err := Timestamps(ctx, &intern.Num{Val: 1})
+	ts, err := Timestamps(ctx, &pb.Num{ReadOnly: true})
 	if err != nil {
+		glog.Errorf("Unable to retrieve readonly ts for export: %v\n", err)
 		return err
 	}
-	readTs := ts.StartId
-	posting.Oracle().WaitForTs(ctx, readTs)
+	readTs := ts.ReadOnly
+	glog.Infof("Got readonly ts from Zero: %d\n", readTs)
 
 	// Let's first collect all groups.
 	gids := groups().KnownGroups()
+	glog.Infof("Requesting export for groups: %v\n", gids)
 
-	ch := make(chan *intern.ExportPayload, len(gids))
+	ch := make(chan error, len(gids))
 	for _, gid := range gids {
 		go func(group uint32) {
-			req := &intern.ExportPayload{
-				ReqId:   uint64(rand.Int63()),
+			req := &pb.ExportRequest{
 				GroupId: group,
 				ReadTs:  readTs,
+				UnixTs:  time.Now().Unix(),
+				Format:  format,
 			}
-			ch <- handleExportForGroupOverNetwork(ctx, req)
+			ch <- handleExportOverNetwork(ctx, req)
 		}(gid)
 	}
 
 	for i := 0; i < len(gids); i++ {
-		bp := <-ch
-		if bp.Status != intern.ExportPayload_SUCCESS {
-			if tr, ok := trace.FromContext(ctx); ok {
-				tr.LazyPrintf("Export status: %v for group id: %d", bp.Status, bp.GroupId)
-			}
-			return fmt.Errorf("Export status: %v for group id: %d", bp.Status, bp.GroupId)
-		}
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("Export successful for group: %v", bp.GroupId)
+		err := <-ch
+		if err != nil {
+			rerr := fmt.Errorf("Export failed at readTs %d. Err=%v", readTs, err)
+			glog.Errorln(rerr)
+			return rerr
 		}
 	}
-	if tr, ok := trace.FromContext(ctx); ok {
-		tr.LazyPrintf("DONE export")
-	}
+	glog.Infof("Export at readTs %d DONE", readTs)
 	return nil
+}
+
+// NormalizeExportFormat returns the normalized string for the export format if it is valid, an
+// empty string otherwise.
+func NormalizeExportFormat(fmt string) string {
+	fmt = strings.ToLower(fmt)
+	if _, ok := exportFormats[fmt]; ok {
+		return fmt
+	}
+	return ""
 }

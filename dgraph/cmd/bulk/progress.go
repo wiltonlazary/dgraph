@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package bulk
@@ -34,7 +33,8 @@ const (
 )
 
 type progress struct {
-	rdfCount        int64
+	nquadCount      int64
+	errCount        int64
 	mapEdgeCount    int64
 	reduceEdgeCount int64
 	reduceKeyCount  int64
@@ -76,14 +76,19 @@ func (p *progress) report() {
 
 func (p *progress) reportOnce() {
 	mapEdgeCount := atomic.LoadInt64(&p.mapEdgeCount)
+	timestamp := time.Now().Format("15:04:05Z0700")
 	switch phase(atomic.LoadInt32((*int32)(&p.phase))) {
 	case nothing:
 	case mapPhase:
-		rdfCount := atomic.LoadInt64(&p.rdfCount)
+		rdfCount := atomic.LoadInt64(&p.nquadCount)
+		errCount := atomic.LoadInt64(&p.errCount)
 		elapsed := time.Since(p.start)
-		fmt.Printf("MAP %s rdf_count:%s rdf_speed:%s/sec edge_count:%s edge_speed:%s/sec\n",
+		fmt.Printf("[%s] MAP %s nquad_count:%s err_count:%s nquad_speed:%s/sec "+
+			"edge_count:%s edge_speed:%s/sec\n",
+			timestamp,
 			x.FixedDuration(elapsed),
 			niceFloat(float64(rdfCount)),
+			niceFloat(float64(errCount)),
 			niceFloat(float64(rdfCount)/elapsed.Seconds()),
 			niceFloat(float64(mapEdgeCount)),
 			niceFloat(float64(mapEdgeCount)/elapsed.Seconds()),
@@ -99,10 +104,11 @@ func (p *progress) reportOnce() {
 		reduceEdgeCount := atomic.LoadInt64(&p.reduceEdgeCount)
 		pct := ""
 		if mapEdgeCount != 0 {
-			pct = fmt.Sprintf("[%.2f%%] ", 100*float64(reduceEdgeCount)/float64(mapEdgeCount))
+			pct = fmt.Sprintf("%.2f%% ", 100*float64(reduceEdgeCount)/float64(mapEdgeCount))
 		}
-		fmt.Printf("REDUCE %s %sedge_count:%s edge_speed:%s/sec "+
+		fmt.Printf("[%s] REDUCE %s %sedge_count:%s edge_speed:%s/sec "+
 			"plist_count:%s plist_speed:%s/sec\n",
+			timestamp,
 			x.FixedDuration(now.Sub(p.start)),
 			pct,
 			niceFloat(float64(reduceEdgeCount)),

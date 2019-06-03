@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2017-2018 Dgraph Labs, Inc. and Contributors
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package query
@@ -22,9 +21,10 @@ import (
 	"math"
 	"time"
 
-	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 type aggregator struct {
@@ -52,14 +52,14 @@ func isBinary(f string) bool {
 		f == "max" || f == "min" || f == "logbase" || f == "pow"
 }
 
-func convertTo(from *intern.TaskValue) (types.Val, error) {
+func convertTo(from *pb.TaskValue) (types.Val, error) {
 	vh, _ := getValue(from)
 	if bytes.Equal(from.Val, x.Nilbyte) {
 		return vh, ErrEmptyVal
 	}
 	va, err := types.Convert(vh, vh.Tid)
 	if err != nil {
-		return vh, x.Wrapf(err, "Fail to convert from api.Value to types.Val")
+		return vh, errors.Wrapf(err, "Fail to convert from api.Value to types.Val")
 	}
 	return va, err
 }
@@ -69,7 +69,7 @@ func compareValues(ag string, va, vb types.Val) (bool, error) {
 		x.Fatalf("Function %v is not binary boolean", ag)
 	}
 
-	isLess, err := types.Less(va, vb)
+	_, err := types.Less(va, vb)
 	if err != nil {
 		//Try to convert values.
 		if va.Tid == types.IntID {
@@ -82,8 +82,15 @@ func compareValues(ag string, va, vb types.Val) (bool, error) {
 			return false, err
 		}
 	}
-	isLess, err = types.Less(va, vb)
+	isLess, err := types.Less(va, vb)
+	if err != nil {
+		return false, err
+	}
 	isMore, err := types.Less(vb, va)
+	if err != nil {
+		return false, err
+	}
+	isEqual, err := types.Equal(va, vb)
 	if err != nil {
 		return false, err
 	}
@@ -93,17 +100,15 @@ func compareValues(ag string, va, vb types.Val) (bool, error) {
 	case ">":
 		return isMore, nil
 	case "<=":
-		return isLess && !isMore, nil
+		return isLess || isEqual, nil
 	case ">=":
-		return isMore && !isLess, nil
+		return isMore || isEqual, nil
 	case "==":
-		return !isMore && !isLess, nil
+		return isEqual, nil
 	case "!=":
-		return isMore || isLess, nil
-	default:
-		return false, x.Errorf("Invalid compare function %v", ag)
+		return !isEqual, nil
 	}
-	return false, nil
+	return false, errors.Errorf("Invalid compare function %q", ag)
 }
 
 func (ag *aggregator) ApplyVal(v types.Val) error {
@@ -131,37 +136,37 @@ func (ag *aggregator) ApplyVal(v types.Val) error {
 		switch ag.name {
 		case "ln":
 			if !isIntOrFloat {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			v.Value = math.Log(l)
 			res = v
 		case "exp":
 			if !isIntOrFloat {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			v.Value = math.Exp(l)
 			res = v
 		case "u-":
 			if !isIntOrFloat {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			v.Value = -l
 			res = v
 		case "sqrt":
 			if !isIntOrFloat {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			v.Value = math.Sqrt(l)
 			res = v
 		case "floor":
 			if !isIntOrFloat {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			v.Value = math.Floor(l)
 			res = v
 		case "ceil":
 			if !isIntOrFloat {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			v.Value = math.Ceil(l)
 			res = v
@@ -170,7 +175,7 @@ func (ag *aggregator) ApplyVal(v types.Val) error {
 				v.Value = float64(time.Since(v.Value.(time.Time))) / 1000000000.0
 				v.Tid = types.FloatID
 			} else {
-				return x.Errorf("Wrong type encountered for func %v", ag.name)
+				return errors.Errorf("Wrong type encountered for func %q", ag.name)
 			}
 			res = v
 		}
@@ -190,37 +195,43 @@ func (ag *aggregator) ApplyVal(v types.Val) error {
 	switch ag.name {
 	case "+":
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v", ag.name)
+			return errors.Errorf("Wrong type encountered for func %q", ag.name)
 		}
 		va.Value = va.Value.(float64) + l
 		res = va
 	case "-":
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v", ag.name)
+			return errors.Errorf("Wrong type encountered for func %q", ag.name)
 		}
 		va.Value = va.Value.(float64) - l
 		res = va
 	case "*":
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v", ag.name)
+			return errors.Errorf("Wrong type encountered for func %q", ag.name)
 		}
 		va.Value = va.Value.(float64) * l
 		res = va
 	case "/":
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v %v %v", ag.name, va.Tid, v.Tid)
+			return errors.Errorf("Wrong type encountered for func %q %q %q", ag.name, va.Tid, v.Tid)
+		}
+		if l == 0 {
+			return errors.Errorf("Division by zero")
 		}
 		va.Value = va.Value.(float64) / l
 		res = va
 	case "%":
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v", ag.name)
+			return errors.Errorf("Wrong type encountered for func %q", ag.name)
+		}
+		if l == 0 {
+			return errors.Errorf("Division by zero")
 		}
 		va.Value = math.Mod(va.Value.(float64), l)
 		res = va
 	case "pow":
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v", ag.name)
+			return errors.Errorf("Wrong type encountered for func %q", ag.name)
 		}
 		va.Value = math.Pow(va.Value.(float64), l)
 		res = va
@@ -229,7 +240,7 @@ func (ag *aggregator) ApplyVal(v types.Val) error {
 			return nil
 		}
 		if !isIntOrFloat {
-			return x.Errorf("Wrong type encountered for func %v", ag.name)
+			return errors.Errorf("Wrong type encountered for func %q", ag.name)
 		}
 		va.Value = math.Log(va.Value.(float64)) / math.Log(l)
 		res = va
@@ -248,7 +259,7 @@ func (ag *aggregator) ApplyVal(v types.Val) error {
 			res = va
 		}
 	default:
-		return x.Errorf("Unhandled aggregator function %v", ag.name)
+		return errors.Errorf("Unhandled aggregator function %q", ag.name)
 	}
 	ag.result = res
 	return nil
@@ -284,9 +295,8 @@ func (ag *aggregator) Apply(val types.Val) {
 			va.Value = va.Value.(int64) + vb.Value.(int64)
 		} else if va.Tid == types.FloatID && vb.Tid == types.FloatID {
 			va.Value = va.Value.(float64) + vb.Value.(float64)
-		} else {
-			// This pair cannot be summed. So pass.
 		}
+		// Skipping the else case since that means the pair cannot be summed.
 		res = va
 	default:
 		x.Fatalf("Unhandled aggregator function %v", ag.name)
@@ -295,10 +305,10 @@ func (ag *aggregator) Apply(val types.Val) {
 	ag.result = res
 }
 
-func (ag *aggregator) ValueMarshalled() (*intern.TaskValue, error) {
+func (ag *aggregator) ValueMarshalled() (*pb.TaskValue, error) {
 	data := types.ValueForType(types.BinaryID)
 	ag.divideByCount()
-	res := &intern.TaskValue{ValType: ag.result.Tid.Enum(), Val: x.Nilbyte}
+	res := &pb.TaskValue{ValType: ag.result.Tid.Enum(), Val: x.Nilbyte}
 	if ag.result.Value == nil {
 		return res, nil
 	}

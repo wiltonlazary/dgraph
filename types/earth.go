@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016-2018 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,13 +50,13 @@ func EarthArea(a float64) Area {
 
 // String converts the length to human readable units
 func (l Length) String() string {
-	if l > 1000 {
+	switch {
+	case l > 1000:
 		return fmt.Sprintf("%.3f km", l/1000)
-	} else if l < 1 {
+	case l < 1:
 		return fmt.Sprintf("%.3f cm", l*100)
-	} else {
-		return fmt.Sprintf("%.3f m", l)
 	}
+	return fmt.Sprintf("%.3f m", l)
 }
 
 const km2 = 1000 * 1000
@@ -64,11 +64,11 @@ const cm2 = 100 * 100
 
 // String converts the area to human readable units
 func (a Area) String() string {
-	if a > km2 {
+	switch {
+	case a > km2:
 		return fmt.Sprintf("%.3f km^2", a/km2)
-	} else if a < 1 {
+	case a < 1:
 		return fmt.Sprintf("%.3f cm^2", a*cm2)
-	} else {
-		return fmt.Sprintf("%.3f m^2", a)
 	}
+	return fmt.Sprintf("%.3f m^2", a)
 }
